@@ -1,0 +1,8 @@
+streamlit>=1.37
+MetaTrader5>=5.0.45
+pandas>=2.0
+numpy>=1.26
+plotly>=5.20
+pydantic>=2.5
+pytest>=8.0
+pyarrow>=14.0

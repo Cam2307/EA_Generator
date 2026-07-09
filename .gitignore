@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+
+# Project runtime artifacts (keep folders, ignore contents)
+data/*
+!data/.gitkeep
+reports/*
+!reports/.gitkeep
+output/*
+!output/.gitkeep
+
+# Logs / temp
+*.log
+*.tmp

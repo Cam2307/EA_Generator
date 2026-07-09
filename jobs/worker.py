@@ -1,0 +1,562 @@
+"""Background job queue.
+
+- Process-wide singleton (`get_job_queue()` is wrapped in st.cache_resource by
+  the dashboard, with a plain module-level fallback for scripts/tests), so
+  Streamlit reruns can never spawn duplicate workers.
+- ThreadPoolExecutor for CPU work (simulation, generation); a dedicated
+  single-slot lane (lock) for MT5 terminal runs.
+- All progress/status/errors are persisted to SQLite through the worker's own
+  short-lived connections; the UI only reads.
+- Cooperative cancellation via a DB flag; idempotent submission by job id.
+"""
+from __future__ import annotations
+
+import os
+import random
+import threading
+import time
+import traceback
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Callable, Dict, Optional
+
+from config import settings
+from factory import data as data_mod
+from factory.backtest.montecarlo import MonteCarloConfig
+from factory.backtest.mt5_runner import MT5Runner
+from factory.backtest.simulator import SimulatorEngine, SymbolSpec
+from factory.backtest.validation import (
+    default_criteria, quick_screen, screen_fitness, validate_strategy,
+)
+from factory.generator import evolve, random_strategy
+from factory.models import (
+    AcceptanceCriteria, BacktestMetrics, ExecutionMechanicType, Job,
+    JobCancelled, JobStatus, StrategyDefinition, ValidationReport,
+)
+from factory import validation_levels
+from factory.storage import Storage
+
+# How long a cancel probe caches its DB answer, so the deep validation loops
+# can poll it thousands of times without hammering SQLite.
+_CANCEL_POLL_INTERVAL = 0.25
+
+
+def _mechanics_from_payload(payload: Dict):
+    """Parse the user's allowed execution mechanics from a job payload.
+
+    Returns a list of :class:`ExecutionMechanicType` (or ``None`` to allow
+    every mechanic). Unknown/invalid entries are ignored; an empty result
+    falls back to all mechanics so a run is never left unable to generate.
+    """
+    raw = payload.get("mechanics")
+    if not raw:
+        return None
+    out = []
+    for name in raw:
+        try:
+            out.append(ExecutionMechanicType(name))
+        except ValueError:
+            continue
+    return out or None
+
+
+def _tm_features_from_payload(payload: Dict):
+    """Parse allowed trade-management overlay features from a job payload.
+
+    Returns a list of feature keys (subset of ``generator.TM_FEATURES``) or
+    ``None`` to allow every overlay. An explicit empty list means "no overlays"
+    (plain fixed SL/TP), which we preserve as an empty list.
+    """
+    raw = payload.get("tm_features")
+    if raw is None:
+        return None
+    from factory.generator import TM_FEATURES
+    valid = set(TM_FEATURES)
+    return [f for f in raw if f in valid]
+
+
+def _spec_overrides_from_payload(payload: Dict) -> Dict[str, float]:
+    """Collect the user-chosen account/execution economics from a payload.
+
+    Only keys the user actually supplied are returned, so unset values keep
+    the engine's inferred defaults (backward compatible). ``point`` is never
+    user-controlled — it is always inferred from the price scale.
+    """
+    out: Dict[str, float] = {}
+    for name in SymbolSpec.OVERRIDABLE:      # contract_size, leverage, spread, slippage
+        value = payload.get(name)
+        if value is not None:
+            out[name] = float(value)
+    return out
+
+
+def _aborted_validation_report(strategy: StrategyDefinition, engine: str,
+                               exc: Exception) -> ValidationReport:
+    """Build a failed report when the validation pipeline aborts mid-run."""
+    return ValidationReport(
+        strategy_id=strategy.id,
+        is_metrics=BacktestMetrics(),
+        oos_metrics=BacktestMetrics(),
+        passed=False,
+        reasons=[f"Validation did not complete: {type(exc).__name__}: {exc}"],
+        engine=engine,
+    )
+
+
+def _persist_complete(storage: Storage, strategy: StrategyDefinition,
+                      report: ValidationReport,
+                      job_id: Optional[str] = None) -> None:
+    """Durably store a finished (pass or fail) validation result."""
+    storage.save_complete(strategy, report, job_id=job_id)
+
+
+def _apply_spec_overrides(engine, spec_overrides: Dict[str, float]) -> None:
+    """Push the user economics into whichever engine will run the backtests.
+
+    The simulator infers ``point`` from price and applies these overrides on
+    top; MT5 only consumes leverage (spread/slippage/contract size are broker-
+    side in the real terminal). A stub/test engine is left untouched.
+    """
+    if not spec_overrides:
+        return
+    if isinstance(engine, SimulatorEngine):
+        engine._spec_overrides = dict(spec_overrides)
+    elif isinstance(engine, MT5Runner) and "leverage" in spec_overrides:
+        engine.leverage = int(spec_overrides["leverage"])
+
+
+# ---------------------------------------------------------------------------
+# Parallel candidate evaluation (process pool)
+#
+# Simulator backtests are CPU-bound pure-Python loops. Running them in the
+# Streamlit process (even on a worker thread) starves the UI via the GIL and
+# limits throughput to a single core — which is why discovery felt slow and the
+# Cancel button appeared frozen. Evaluating a whole generation across a process
+# pool uses every core AND keeps the UI thread free, so Cancel responds at once.
+# ---------------------------------------------------------------------------
+
+def _discovery_pool_size(gen_size: int) -> int:
+    """Worker count: use most cores but leave one for the UI, capped sanely."""
+    cores = os.cpu_count() or 2
+    return max(1, min(cores - 1, 8, gen_size))
+
+
+def _pool_cancel_check(db_path, job_id: str) -> Callable[[], bool]:
+    """A throttled DB cancel probe for a pool worker process.
+
+    Each worker opens its own short-lived SQLite connections; caching the
+    answer for a fraction of a second keeps the deep validation loops cheap
+    while still aborting the in-flight backtest within ~0.25s of a click.
+    """
+    storage = Storage(Path(db_path))
+    state = {"ts": 0.0, "cancelled": False}
+
+    def _check() -> bool:
+        if state["cancelled"]:
+            return True
+        now = time.monotonic()
+        if now - state["ts"] >= _CANCEL_POLL_INTERVAL:
+            state["ts"] = now
+            try:
+                state["cancelled"] = storage.is_cancel_requested(job_id)
+            except Exception:
+                pass
+        return state["cancelled"]
+
+    return _check
+
+
+def _evaluate_candidate(task: Dict) -> Dict:
+    """Screen one candidate and, if promising, fully validate it.
+
+    Runs inside a pool worker process; returns a picklable result dict. All
+    exceptions are captured (never raised across the process boundary) so the
+    dispatcher can account for every candidate deterministically.
+    """
+    strat = task["strategy"]
+    start, end, deposit = task["start"], task["end"], task["deposit"]
+    criteria = task["criteria"]
+    spec_overrides = task["spec_overrides"] or None
+    storage = Storage(Path(task["db_path"]))
+    cancel_check = _pool_cancel_check(task["db_path"], task["job_id"])
+
+    engine = SimulatorEngine(spec_overrides=spec_overrides)
+    engine._cancel_check = cancel_check
+    result = {"strategy": strat, "fitness": 0.0, "promising": False,
+              "passed": False, "error": None, "cancelled": False}
+    try:
+        promising, m = quick_screen(engine, strat, start, end, deposit, criteria)
+        result["fitness"] = screen_fitness(m)
+        if not promising:
+            return result
+        result["promising"] = True
+        report = validate_strategy(
+            engine, strat, start, end, deposit=deposit, seed=task["seed"],
+            criteria=criteria, run_montecarlo=task["run_mc"],
+            mc_config=task["mc_config"], wfo_train_months=task["wfo_train"],
+            wfo_test_months=task["wfo_test"], wfo_windows=task["wfo_n"],
+            data_source=task["data_source"], cancel_check=cancel_check,
+            spec_overrides=spec_overrides)
+        result["passed"] = report.passed
+        storage.save_complete(strat, report, job_id=task["job_id"])
+        return result
+    except JobCancelled:
+        result["cancelled"] = True
+        return result
+    except Exception as exc:                       # noqa: BLE001 - abort, don't crash
+        result["error"] = f"{type(exc).__name__}: {exc}"
+        if result["promising"]:
+            report = _aborted_validation_report(strat, "simulator", exc)
+            storage.save_complete(strat, report, job_id=task["job_id"])
+        return result
+
+
+class JobQueue:
+    def __init__(self, storage: Optional[Storage] = None):
+        self.storage = storage or Storage()
+        self._executor = ThreadPoolExecutor(max_workers=2,
+                                            thread_name_prefix="eafactory")
+        self._mt5_lane = threading.Lock()   # max one concurrent MT5 terminal
+        self._submitted: Dict[str, bool] = {}
+        self._submit_lock = threading.Lock()
+        self._reconcile_orphaned_jobs()
+
+    def _reconcile_orphaned_jobs(self) -> None:
+        """Close out jobs left ``PENDING``/``RUNNING`` by a previous process.
+
+        Workers are threads inside this process, so a shutdown/restart kills
+        them mid-run while their SQLite row stays ``RUNNING``. A freshly built
+        queue has no in-flight work by definition, so any such row is an orphan
+        with no thread behind it — which is exactly what makes a stuck
+        "Cancelling…" hang forever (nothing is left to honour the flag). Mark
+        them ``CANCELLED`` so the UI reflects reality and the slot frees up.
+        """
+        for job in self.storage.list_jobs():
+            if job.status in (JobStatus.PENDING, JobStatus.RUNNING):
+                self.storage.set_job_status(
+                    job.id, JobStatus.CANCELLED,
+                    message="stopped — interrupted by an app restart")
+
+    # ------------------------------------------------------------------
+    # Submission (idempotent by job id)
+    # ------------------------------------------------------------------
+    def submit_discovery(self, job_id: str, payload: Dict) -> bool:
+        """Enqueue a discovery batch. Returns False when the id is already
+        pending/running (rerun-triggered double clicks are dropped)."""
+        with self._submit_lock:
+            existing = self.storage.get_job(job_id)
+            if existing and existing.status in (JobStatus.PENDING, JobStatus.RUNNING):
+                return False
+            if self._submitted.get(job_id):
+                return False
+            self._submitted[job_id] = True
+
+        job = Job(id=job_id, kind="discovery", payload=payload)
+        self.storage.upsert_job(job)
+        self._executor.submit(self._run_discovery_safe, job_id)
+        return True
+
+    def cancel(self, job_id: str) -> None:
+        self.storage.request_cancel(job_id)
+
+    def _make_cancel_check(self, job_id: str) -> Callable[[], bool]:
+        """A throttled probe of the DB cancel flag for the validation pipeline.
+
+        The expensive per-candidate work (IS optimization, walk-forward, Monte
+        Carlo) calls this at many safe points; caching the answer for a short
+        interval keeps that cheap while still aborting within ~0.25s of a click.
+        """
+        state = {"ts": 0.0, "cancelled": False}
+
+        def _check() -> bool:
+            if state["cancelled"]:
+                return True
+            now = time.monotonic()
+            if now - state["ts"] >= _CANCEL_POLL_INTERVAL:
+                state["ts"] = now
+                state["cancelled"] = self.storage.is_cancel_requested(job_id)
+            return state["cancelled"]
+
+        return _check
+
+    # ------------------------------------------------------------------
+    # Discovery pipeline
+    # ------------------------------------------------------------------
+    def _run_discovery_safe(self, job_id: str) -> None:
+        try:
+            self._run_discovery(job_id)
+        except Exception:
+            self.storage.set_job_status(job_id, JobStatus.FAILED,
+                                        error=traceback.format_exc())
+        finally:
+            with self._submit_lock:
+                self._submitted.pop(job_id, None)
+
+    def _make_engine(self, engine_name: str):
+        if engine_name == "mt5":
+            return MT5Runner()
+        return SimulatorEngine()
+
+    def _run_discovery(self, job_id: str) -> None:
+        """Continuous, two-stage discovery.
+
+        Stage 1 (fast screen): every generated candidate gets a single cheap
+        full-range simulation. Obvious losers are discarded immediately, so
+        thousands of parameter combinations can be triaged quickly.
+
+        Stage 2 (full validation): only promising candidates run the expensive
+        IS/OOS + walk-forward + Monte Carlo pipeline. Every candidate that
+        completes (or aborts) full validation is persisted to SQLite — pass
+        or fail — so nothing is lost on restart or when the survivor quota
+        is met.
+
+        The loop keeps generating new generations (random + genetic evolution
+        of the best screened candidates) until it has found the requested
+        number of survivors, exhausted the candidate budget, or is cancelled.
+        """
+        storage = self.storage
+        job = storage.get_job(job_id)
+        payload = job.payload
+        storage.set_job_status(job_id, JobStatus.RUNNING, message="starting")
+
+        symbol = payload.get("symbol", settings.DEFAULT_SYMBOL)
+        timeframe = payload.get("timeframe", settings.DEFAULT_TIMEFRAME)
+        engine_name = payload.get("engine", settings.DEFAULT_ENGINE)
+        deposit = float(payload.get("deposit", settings.DEFAULT_DEPOSIT))
+        spec_overrides = _spec_overrides_from_payload(payload)
+        seed = payload.get("seed")
+
+        # generation size + loop budget (thousands of candidates supported)
+        gen_size = int(payload.get("batch_size", 100))
+        gen_size = max(1, gen_size)
+        target_survivors = int(payload.get("target_survivors", 5))
+        max_candidates = int(payload.get("max_candidates", 1000))
+        use_genetic = bool(payload.get("genetic", True))
+        allowed_mechanics = _mechanics_from_payload(payload)
+        allowed_tm_features = _tm_features_from_payload(payload)
+
+        start = datetime.fromisoformat(payload["start"]) if payload.get("start") \
+            else datetime.now(timezone.utc) - timedelta(days=365)
+        end = datetime.fromisoformat(payload["end"]) if payload.get("end") \
+            else datetime.now(timezone.utc)
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+
+        # Validation gates come from a named level (easy mode) unless the user
+        # supplied explicit custom criteria (expert override).
+        if payload.get("criteria"):
+            criteria = AcceptanceCriteria(**payload["criteria"])
+            run_mc = payload.get("montecarlo")       # None -> settings default
+            mc_config = None
+            if payload.get("mc_runs"):
+                mc_config = MonteCarloConfig(n_runs=int(payload["mc_runs"]))
+        elif payload.get("validation_level") is not None:
+            level = validation_levels.get_level(int(payload["validation_level"]))
+            criteria = level.criteria
+            run_mc = level.montecarlo
+            mc_config = validation_levels.mc_config_for(level)
+        else:
+            criteria = default_criteria()
+            run_mc = payload.get("montecarlo")
+            mc_config = None
+
+        wfo_train = int(payload.get("wfo_train_months", settings.WFO_TRAIN_MONTHS))
+        wfo_test = int(payload.get("wfo_test_months", settings.WFO_TEST_MONTHS))
+        wfo_n = int(payload.get("wfo_windows", settings.WFO_WINDOWS))
+        data_source = payload.get("data_source")
+        if not data_source:
+            try:
+                data_source = data_mod.peek_source(symbol, timeframe, start, end)
+            except Exception:
+                data_source = "unknown"
+
+        rng = random.Random(seed)
+        engine = self._make_engine(engine_name)
+        _apply_spec_overrides(engine, spec_overrides)
+        cancel_check = self._make_cancel_check(job_id)
+        # Let the engine abort a long backtest mid-loop, not just between
+        # candidates — the simulator polls this probe inside its bar loop.
+        if isinstance(engine, SimulatorEngine):
+            engine._cancel_check = cancel_check
+
+        tested = 0            # candidates that ran the fast screen
+        screened_in = 0       # candidates promising enough for full validation
+        survivors = 0         # strategies passing all gates
+        errors = 0
+        scored: list = []     # (strategy, screen_fitness) for genetic evolution
+        generation = 0
+
+        def _progress_msg() -> str:
+            return (f"tested {tested}/{max_candidates} · promising {screened_in}"
+                    f" · survivors {survivors}/{target_survivors}"
+                    f" · gen {generation}")
+
+        def _persist_progress() -> None:
+            """Write the current live counters so the 2s UI fragment reflects
+            them mid-run. Progress blends candidate budget with survivor target."""
+            frac = max(tested / max_candidates,
+                       survivors / max(target_survivors, 1))
+            storage.update_job_progress(
+                job_id, min(frac, 0.999), _progress_msg(),
+                tested=tested, promising=screened_in,
+                survivors=survivors, generation=generation)
+
+        def _cancelled_now() -> bool:
+            return storage.is_cancel_requested(job_id)
+
+        def _finish_cancelled() -> None:
+            storage.set_job_status(
+                job_id, JobStatus.CANCELLED,
+                message=f"cancelled — {_progress_msg()}")
+
+        def _build_population(this_gen: int):
+            if generation == 0 or not (use_genetic and scored):
+                return [random_strategy(symbol, timeframe, rng,
+                                        allowed_mechanics=allowed_mechanics,
+                                        allowed_tm_features=allowed_tm_features)
+                        for _ in range(this_gen)]
+            top = sorted(scored, key=lambda t: t[1], reverse=True)[:50]
+            pop = evolve(top, this_gen, rng)
+            n_fresh = max(1, this_gen // 5)      # fresh blood vs. convergence
+            pop[:n_fresh] = [random_strategy(symbol, timeframe, rng,
+                                             allowed_mechanics=allowed_mechanics,
+                                             allowed_tm_features=allowed_tm_features)
+                             for _ in range(n_fresh)]
+            return pop
+
+        # Simulator work fans out across a process pool (parallel, off the UI
+        # thread). MT5 stays strictly sequential — one terminal, one run.
+        pool = None
+        if engine_name != "mt5":
+            pool = ProcessPoolExecutor(max_workers=_discovery_pool_size(gen_size))
+
+        def _make_task(strat) -> Dict:
+            return {
+                "strategy": strat, "start": start, "end": end,
+                "deposit": deposit, "criteria": criteria, "run_mc": run_mc,
+                "mc_config": mc_config, "wfo_train": wfo_train,
+                "wfo_test": wfo_test, "wfo_n": wfo_n, "data_source": data_source,
+                "spec_overrides": spec_overrides, "seed": rng.randint(0, 2**31),
+                "db_path": str(self.storage.db_path), "job_id": job_id,
+            }
+
+        try:
+            while tested < max_candidates and survivors < target_survivors:
+                if _cancelled_now():
+                    _finish_cancelled()
+                    return
+
+                remaining = max_candidates - tested
+                population = _build_population(min(gen_size, remaining))
+
+                if pool is None:
+                    # -- MT5: strictly sequential, full pipeline per candidate --
+                    for strat in population:
+                        if _cancelled_now():
+                            _finish_cancelled()
+                            return
+                        if survivors >= target_survivors:
+                            break
+                        tested += 1
+                        _persist_progress()
+                        engine_label = getattr(engine, "name", engine_name)
+                        try:
+                            with self._mt5_lane:
+                                report = validate_strategy(
+                                    engine, strat, start, end, deposit=deposit,
+                                    seed=rng.randint(0, 2**31), criteria=criteria,
+                                    run_montecarlo=run_mc, mc_config=mc_config,
+                                    wfo_train_months=wfo_train,
+                                    wfo_test_months=wfo_test, wfo_windows=wfo_n,
+                                    data_source=data_source,
+                                    cancel_check=cancel_check,
+                                    spec_overrides=spec_overrides)
+                        except JobCancelled:
+                            _finish_cancelled()
+                            return
+                        except Exception as exc:
+                            errors += 1
+                            report = _aborted_validation_report(
+                                strat, engine_label, exc)
+                            _persist_complete(storage, strat, report,
+                                              job_id=job_id)
+                            storage.set_job_status(
+                                job_id, JobStatus.RUNNING,
+                                error=f"{type(exc).__name__}: {exc}")
+                        else:
+                            _persist_complete(storage, strat, report,
+                                              job_id=job_id)
+                        scored.append((strat, screen_fitness(report.oos_metrics)))
+                        if report.passed:
+                            survivors += 1
+                        _persist_progress()
+                else:
+                    # -- Simulator: evaluate the whole generation in parallel --
+                    futures = [pool.submit(_evaluate_candidate, _make_task(s))
+                               for s in population]
+                    try:
+                        for fut in as_completed(futures):
+                            try:
+                                res = fut.result()
+                            except Exception as exc:       # pool/worker failure
+                                tested += 1
+                                errors += 1
+                                storage.set_job_status(
+                                    job_id, JobStatus.RUNNING,
+                                    error=f"pool: {type(exc).__name__}: {exc}")
+                                continue
+                            tested += 1
+                            scored.append((res["strategy"], res["fitness"]))
+                            if res["promising"]:
+                                screened_in += 1
+                                if res["passed"]:
+                                    survivors += 1
+                                if res["error"]:
+                                    errors += 1
+                                    storage.set_job_status(
+                                        job_id, JobStatus.RUNNING,
+                                        error=res["error"])
+                            _persist_progress()
+                            if survivors >= target_survivors or _cancelled_now():
+                                break
+                    finally:
+                        for fut in futures:
+                            fut.cancel()
+
+                    if _cancelled_now():
+                        _finish_cancelled()
+                        return
+
+                generation += 1
+        finally:
+            if pool is not None:
+                pool.shutdown(wait=False, cancel_futures=True)
+
+        total_passing = len(self.storage.list_validated(passed_only=True))
+        storage.update_job_progress(
+            job_id, 1.0,
+            f"done — {_progress_msg()} ({total_passing} passing in library)",
+            tested=tested, promising=screened_in,
+            survivors=survivors, generation=generation)
+        storage.set_job_status(job_id, JobStatus.DONE)
+
+
+# ---------------------------------------------------------------------------
+# Singleton access
+# ---------------------------------------------------------------------------
+
+_queue_lock = threading.Lock()
+_queue: Optional[JobQueue] = None
+
+
+def get_job_queue() -> JobQueue:
+    """Module-level singleton. The dashboard additionally wraps this in
+    st.cache_resource so Streamlit reruns always reuse one instance."""
+    global _queue
+    with _queue_lock:
+        if _queue is None:
+            _queue = JobQueue()
+        return _queue
