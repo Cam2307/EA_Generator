@@ -144,6 +144,17 @@ class Lineage(BaseModel):
     generation: int = 0
 
 
+class StrategyProfile(BaseModel):
+    """Describes how sophisticated a generated strategy is."""
+    advanced_mode: bool = False
+    complexity_score: int = 0
+    complexity_cap: int = 2
+    regime_switching: bool = False
+    mtf_context: bool = False
+    feature_toggles: List[str] = Field(default_factory=list)
+    portfolio_signature: str = ""
+
+
 class StrategyDefinition(BaseModel):
     id: str = Field(default_factory=lambda: uuid.uuid4().hex)
     name: str = ""
@@ -156,6 +167,7 @@ class StrategyDefinition(BaseModel):
     trade_mgmt: TradeManagement = Field(default_factory=TradeManagement)
     rule_description: str = ""
     lineage: Lineage = Field(default_factory=Lineage)
+    profile: StrategyProfile = Field(default_factory=StrategyProfile)
     created_at: float = Field(default_factory=time.time)
 
     def all_params(self) -> Dict[str, float]:
@@ -353,6 +365,14 @@ class ValidationReport(BaseModel):
     # Rolling walk-forward window sizing (months); None = legacy fraction-based
     wfo_train_months: Optional[int] = None
     wfo_test_months: Optional[int] = None
+    # Composite discovery quality score (0..100), used for promotion/alerting.
+    quality_score: float = 0.0
+    # Human-readable score components for transparent ranking/triage.
+    quality_breakdown: Dict[str, float] = Field(default_factory=dict)
+    # Promotion lifecycle: candidate -> validated -> edge_positive -> promoted_live_watchlist.
+    promotion_state: str = "candidate"
+    # Hard-gate flag for alert eligibility (strict minimum safety gates).
+    hard_gates_passed: bool = False
 
 
 # ---------------------------------------------------------------------------

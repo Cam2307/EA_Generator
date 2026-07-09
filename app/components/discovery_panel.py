@@ -14,7 +14,20 @@ from factory.backtest.simulator import SymbolSpec
 from factory.metrics_display import data_source_badge, data_source_label
 from factory.models import ExecutionMechanicType, JobStatus
 from factory.storage import Storage
+from jobs.orchestrator import start_orchestrator_process, stop_orchestrator_process
 from jobs.worker import JobQueue
+from factory import alerts as alerts_mod
+
+send_email = alerts_mod.send_email
+# Backward-compat fallback for stale/older alert modules during hot reloads.
+smtp_diagnostics = getattr(
+    alerts_mod, "smtp_diagnostics", lambda: type("Diag", (), {"configured": False})()
+)
+smtp_missing_message = getattr(
+    alerts_mod,
+    "smtp_missing_message",
+    lambda _diag: "SMTP diagnostics unavailable in this build.",
+)
 
 _ACTIVE = (JobStatus.PENDING, JobStatus.RUNNING)
 
@@ -40,6 +53,7 @@ _TM_FEATURE_LABELS = {
 
 
 def render_discovery_panel(queue: JobQueue, storage: Storage) -> None:
+    _render_discovery_agent_panel(storage)
     # Live progress, KPIs and run history sit at the very top — this is the
     # screen users watch the longest while a run is in flight, so it gets the
     # most visual priority.
@@ -182,6 +196,28 @@ def render_discovery_panel(queue: JobQueue, storage: Storage) -> None:
                     "Evolve toward winners", value=True,
                     help="Breed the best-screened candidates into each new "
                          "generation instead of pure random search.")
+            st.markdown("**Advanced strategy generation**")
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                advanced_mode = st.checkbox(
+                    "Enable advanced mode", value=False,
+                    help="Generate richer multi-signal candidates with anti-bloat caps.")
+            with c2:
+                complexity_cap = st.slider(
+                    "Complexity cap", 2, 10, 5,
+                    help="Maximum complexity budget for entry logic; higher explores more expressive rules.")
+            with c3:
+                enable_regime_switching = st.checkbox(
+                    "Enable regime switching", value=True,
+                    help="Bias generation toward volatility/trend state-aware compositions.")
+            enable_mtf_context = st.checkbox(
+                "Enable multi-timeframe context", value=True,
+                help="Inject higher-timeframe context filters when compatible.")
+            feature_toggles = st.multiselect(
+                "Feature families",
+                options=["momentum", "mean_reversion", "volatility", "market_structure"],
+                default=["momentum", "mean_reversion", "volatility", "market_structure"],
+                help="Constrain advanced primitives to selected families.")
 
             use_custom = st.checkbox(
                 "Override the level with custom gates (expert)", value=False,
@@ -262,6 +298,11 @@ def render_discovery_panel(queue: JobQueue, storage: Storage) -> None:
                 "wfo_train_months": int(wfo_train_months),
                 "wfo_test_months": int(wfo_test_months),
                 "wfo_windows": int(wfo_window_count),
+                "advanced_mode": bool(advanced_mode),
+                "complexity_cap": int(complexity_cap),
+                "enable_regime_switching": bool(enable_regime_switching),
+                "enable_mtf_context": bool(enable_mtf_context),
+                "feature_toggles": list(feature_toggles),
             }
             try:
                 payload["data_source"] = data_mod.peek_source(
@@ -594,3 +635,240 @@ def _request_cancel(queue: JobQueue, job_id: str) -> None:
     """
     queue.cancel(job_id)
     st.toast(f"Cancellation requested for {job_id}")
+
+
+def _render_discovery_agent_panel(storage: Storage) -> None:
+    """Detached discovery-agent controls and alert settings."""
+    state = storage.get_agent_state()
+    app_cfg = storage.get_app_settings()
+    st.subheader(":material/smart_toy: Discovery agent")
+    with st.container(border=True):
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("Status", str(state.get("status", "stopped")))
+        hb = state.get("heartbeat_at")
+        hb_txt = "never" if not hb else datetime.fromtimestamp(hb).strftime("%H:%M:%S")
+        s2.metric("Heartbeat", hb_txt)
+        s3.metric("Queue depth", int(state.get("queue_depth", 0) or 0))
+        s4.metric("Sweeps submitted", int(state.get("jobs_submitted", 0) or 0))
+
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button(":material/play_arrow: Start agent", width="stretch"):
+                storage.update_agent_state(enabled=1, status="starting")
+                started = start_orchestrator_process()
+                if started:
+                    st.success("Discovery agent service started.")
+                else:
+                    st.info("Discovery agent already running.")
+                st.rerun()
+        with c2:
+            if st.button(":material/stop: Stop agent", width="stretch"):
+                stop_orchestrator_process()
+                st.warning("Stop requested for discovery agent.")
+                st.rerun()
+
+        st.markdown("#### Agent settings")
+        st.caption(
+            "Configure what the discovery agent searches, how aggressive each run is, "
+            "and when it sends notifications."
+        )
+        smtp_diag_key = "smtp_diag_refresh_nonce"
+        st.session_state.setdefault(smtp_diag_key, 0)
+        smtp_diag = smtp_diagnostics()
+        if smtp_diag.configured:
+            st.success(
+                "SMTP configured: "
+                f"host `{smtp_diag.host}:{smtp_diag.port}` · "
+                f"from `{smtp_diag.from_email or smtp_diag.username}` · "
+                f"TLS `{'on' if smtp_diag.use_tls else 'off'}`"
+            )
+        else:
+            st.warning(smtp_missing_message(smtp_diag))
+        st.caption(
+            f"SMTP auth user: `{smtp_diag.username or '(none)'}` · "
+            f"password configured: `{'yes' if smtp_diag.has_password else 'no'}`"
+        )
+        if st.button(":material/refresh: Reload SMTP config", width="content"):
+            st.session_state[smtp_diag_key] = int(st.session_state[smtp_diag_key]) + 1
+            st.rerun()
+
+        with st.form("agent_settings_form"):
+            st.markdown("##### :material/tune: Notifications")
+            n1, n2, n3 = st.columns(3)
+            with n1:
+                recipient = st.text_input(
+                    "Alert recipient email",
+                    value=str(app_cfg.get("recipient_email", settings.DEFAULT_ALERT_RECIPIENT)),
+                    help="Where pass alerts and promotion notifications are sent.",
+                )
+            with n2:
+                min_score = st.number_input(
+                    "Minimum quality score to alert",
+                    min_value=0.0,
+                    max_value=100.0,
+                    value=float(app_cfg.get("alert_min_score", 70.0)),
+                    step=1.0,
+                    help="Only strategies scoring at or above this value trigger an email.",
+                )
+            with n3:
+                cooldown_min = st.number_input(
+                    "Alert cooldown (minutes)",
+                    min_value=1,
+                    max_value=10_000,
+                    value=int(app_cfg.get("alert_cooldown_minutes", 60)),
+                    step=1,
+                    help="Minimum time between alert emails.",
+                )
+
+            st.markdown("##### :material/travel_explore: What to search")
+            s1, s2, s3 = st.columns(3)
+            with s1:
+                symbols = st.multiselect(
+                    "Symbols",
+                    options=list(settings.SYMBOLS),
+                    default=list(app_cfg.get("agent_symbols", settings.SYMBOLS[:5])),
+                    help="Instruments the agent will sweep.",
+                )
+            with s2:
+                tf = st.multiselect(
+                    "Timeframes",
+                    options=["M1", "M5", "M15", "M30", "H1", "H4", "D1"],
+                    default=list(app_cfg.get("agent_timeframes", ["M15", "H1"])),
+                    help="Chart intervals included in each sweep.",
+                )
+            with s3:
+                strictness = st.multiselect(
+                    "Validation strictness",
+                    options=["easy", "normal", "hard", "custom"],
+                    default=list(app_cfg.get(
+                        "agent_strictness_profiles",
+                        ["easy", "normal", "hard", "custom"],
+                    )),
+                    help="Gate profiles used during validation.",
+                )
+
+            st.markdown("##### :material/schedule: Run budget")
+            b1, b2, b3, b4 = st.columns(4)
+            with b1:
+                months = st.number_input(
+                    "History (months)",
+                    min_value=1,
+                    max_value=36,
+                    value=int(app_cfg.get("agent_history_months", 12)),
+                    step=1,
+                    help="Backtest window length used by the agent.",
+                )
+            with b2:
+                agent_batch = st.number_input(
+                    "Batch size",
+                    min_value=10,
+                    max_value=5000,
+                    value=int(app_cfg.get("agent_batch_size", 100)),
+                    help="Candidates generated per generation.",
+                )
+            with b3:
+                agent_max = st.number_input(
+                    "Max candidates",
+                    min_value=10,
+                    max_value=100000,
+                    value=int(app_cfg.get("agent_max_candidates", 1000)),
+                    help="Hard cap per sweep.",
+                )
+            with b4:
+                agent_target = st.number_input(
+                    "Target survivors",
+                    min_value=1,
+                    max_value=100,
+                    value=int(app_cfg.get("agent_target_survivors", 2)),
+                    help="Stop once this many passing strategies are found.",
+                )
+
+            with st.expander(":material/science: Advanced generation options"):
+                st.caption(
+                    "These control search sophistication. Defaults are good for most runs."
+                )
+                ag1, ag2, ag3 = st.columns(3)
+                with ag1:
+                    agent_advanced_mode = st.checkbox(
+                        "Enable advanced mode",
+                        value=bool(app_cfg.get("agent_advanced_mode", True)),
+                        help="Turns on richer building blocks and search operators.",
+                    )
+                with ag2:
+                    agent_complexity_cap = st.slider(
+                        "Complexity cap",
+                        2,
+                        10,
+                        int(app_cfg.get("agent_complexity_cap", 6)),
+                        help="Upper bound on strategy complexity.",
+                    )
+                with ag3:
+                    agent_regime = st.checkbox(
+                        "Enable regime switching",
+                        value=bool(app_cfg.get("agent_enable_regime_switching", True)),
+                        help="Allow market-regime-aware variants.",
+                    )
+                agent_mtf = st.checkbox(
+                    "Enable multi-timeframe context",
+                    value=bool(app_cfg.get("agent_enable_mtf_context", True)),
+                    help="Use higher/lower timeframe context as additional signals.",
+                )
+                agent_feature_toggles = st.multiselect(
+                    "Feature families",
+                    options=["momentum", "mean_reversion", "volatility", "market_structure"],
+                    default=list(app_cfg.get(
+                        "agent_feature_toggles",
+                        ["momentum", "mean_reversion", "volatility", "market_structure"],
+                    )),
+                    help="Signal families the generator may include.",
+                )
+
+            save = st.form_submit_button(
+                ":material/save: Save agent settings",
+                type="primary",
+                width="stretch",
+            )
+            if save:
+                storage.upsert_app_settings(
+                    {
+                        "recipient_email": recipient.strip(),
+                        "alert_min_score": float(min_score),
+                        "alert_cooldown_minutes": int(cooldown_min),
+                        "agent_timeframes": list(tf) or ["M15", "H1"],
+                        "agent_strictness_profiles": list(strictness) or ["normal"],
+                        "agent_history_months": int(months),
+                        "agent_symbols": list(symbols) or settings.SYMBOLS[:5],
+                        "agent_batch_size": int(agent_batch),
+                        "agent_max_candidates": int(agent_max),
+                        "agent_target_survivors": int(agent_target),
+                        "agent_advanced_mode": bool(agent_advanced_mode),
+                        "agent_complexity_cap": int(agent_complexity_cap),
+                        "agent_enable_regime_switching": bool(agent_regime),
+                        "agent_enable_mtf_context": bool(agent_mtf),
+                        "agent_feature_toggles": list(agent_feature_toggles)
+                        or ["momentum", "mean_reversion", "volatility", "market_structure"],
+                    }
+                )
+                st.success("Discovery agent settings saved.")
+                st.rerun()
+        test_default_recipient = str(app_cfg.get("recipient_email", settings.DEFAULT_ALERT_RECIPIENT)).strip()
+        test_recipient_override = st.text_input(
+            "Test email recipient (optional override)",
+            value=test_default_recipient,
+            key="test_email_recipient_override",
+            help="Used only for the test send button below.",
+        )
+        if st.button("Send test email", key="send_test_email"):
+            recipient = test_recipient_override.strip() or test_default_recipient
+            if not recipient:
+                st.error("Set an alert recipient email first, then retry.")
+                return
+            try:
+                send_email(
+                    recipient,
+                    "EA Generator test email",
+                    "This is a test email from the EA Generator discovery agent.",
+                )
+                st.success(f"Test email sent to {recipient}.")
+            except Exception as exc:
+                st.error(f"Test email failed: {exc}")

@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import random
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from factory.models import (
     EntryFilter, EntryFilterType, ExecutionMechanic, ExecutionMechanicType,
     Lineage, LotMode, ParamRange, RiskBlock, StopLossMode, StrategyDefinition,
-    TakeProfitMode, TradeManagement, TrailMode,
+    StrategyProfile, TakeProfitMode, TradeManagement, TrailMode,
 )
 
 # ---------------------------------------------------------------------------
@@ -330,6 +331,65 @@ _NOUNS = ["Scalper", "Sentinel", "Harvester", "Navigator", "Breaker",
 
 _MAGIC_BASE = 770000
 
+_TREND_FILTERS = {
+    EntryFilterType.MA_CROSS, EntryFilterType.MACD_CROSS,
+    EntryFilterType.ADX_TREND, EntryFilterType.MOMENTUM,
+    EntryFilterType.PARABOLIC_SAR, EntryFilterType.ICHIMOKU,
+    EntryFilterType.AWESOME, EntryFilterType.FORCE_INDEX,
+    EntryFilterType.DEMA_CROSS, EntryFilterType.RVI,
+}
+_MEAN_REVERSION_FILTERS = {
+    EntryFilterType.RSI_REVERSION, EntryFilterType.BOLLINGER_FADE,
+    EntryFilterType.STOCHASTIC, EntryFilterType.CCI_REVERSION,
+    EntryFilterType.WILLIAMS_R, EntryFilterType.DEMARKER,
+    EntryFilterType.MFI, EntryFilterType.ENVELOPES,
+}
+_VOLATILITY_FILTERS = {
+    EntryFilterType.MTF_VOLATILITY, EntryFilterType.STDDEV_REGIME,
+    EntryFilterType.VOLUME_SURGE,
+}
+_STRUCTURE_FILTERS = {
+    EntryFilterType.PRICE_ACTION_BREAKOUT, EntryFilterType.LIQUIDITY_ZONE,
+}
+_REGIME_FILTERS = {
+    EntryFilterType.MTF_VOLATILITY, EntryFilterType.STDDEV_REGIME,
+    EntryFilterType.ADX_TREND,
+}
+_COMPLEXITY_COST = {
+    EntryFilterType.PRICE_ACTION_BREAKOUT: 2,
+    EntryFilterType.MTF_VOLATILITY: 3,
+    EntryFilterType.LIQUIDITY_ZONE: 2,
+    EntryFilterType.RSI_REVERSION: 1,
+    EntryFilterType.MA_CROSS: 1,
+    EntryFilterType.BOLLINGER_FADE: 2,
+    EntryFilterType.MACD_CROSS: 2,
+    EntryFilterType.STOCHASTIC: 1,
+    EntryFilterType.ADX_TREND: 2,
+    EntryFilterType.CCI_REVERSION: 2,
+    EntryFilterType.MOMENTUM: 1,
+    EntryFilterType.WILLIAMS_R: 1,
+    EntryFilterType.VOLUME_SURGE: 2,
+    EntryFilterType.PARABOLIC_SAR: 2,
+    EntryFilterType.ICHIMOKU: 3,
+    EntryFilterType.DEMARKER: 1,
+    EntryFilterType.AWESOME: 1,
+    EntryFilterType.FORCE_INDEX: 1,
+    EntryFilterType.STDDEV_REGIME: 2,
+    EntryFilterType.ENVELOPES: 1,
+    EntryFilterType.MFI: 1,
+    EntryFilterType.RVI: 2,
+    EntryFilterType.DEMA_CROSS: 2,
+}
+
+
+@dataclass(frozen=True)
+class GenerationSettings:
+    advanced_mode: bool = False
+    complexity_cap: int = 4
+    enable_regime_switching: bool = False
+    enable_mtf_context: bool = False
+    feature_toggles: Optional[Sequence[str]] = None
+
 
 def _sample_params(specs: Dict[str, ParamRange], rng: random.Random) -> Dict[str, float]:
     out: Dict[str, float] = {}
@@ -337,6 +397,89 @@ def _sample_params(specs: Dict[str, ParamRange], rng: random.Random) -> Dict[str
         n_steps = int(round((r.max - r.min) / r.step)) if r.step > 0 else 0
         out[name] = r.min + rng.randint(0, n_steps) * r.step if n_steps else r.min
     return out
+
+
+def _is_allowed_by_toggle(ft: EntryFilterType, toggles: Optional[Sequence[str]]) -> bool:
+    if not toggles:
+        return True
+    enabled = set(toggles)
+    if ft in _TREND_FILTERS and "momentum" in enabled:
+        return True
+    if ft in _MEAN_REVERSION_FILTERS and "mean_reversion" in enabled:
+        return True
+    if ft in _VOLATILITY_FILTERS and "volatility" in enabled:
+        return True
+    if ft in _STRUCTURE_FILTERS and "market_structure" in enabled:
+        return True
+    return False
+
+
+def _pick_filter_pack(
+    compatible: Sequence[EntryFilterType],
+    rng: random.Random,
+    settings: GenerationSettings,
+) -> List[EntryFilterType]:
+    allowed = [ft for ft in compatible if _is_allowed_by_toggle(ft, settings.feature_toggles)]
+    if not allowed:
+        allowed = list(compatible)
+
+    if not settings.advanced_mode:
+        return rng.sample(allowed, rng.randint(1, min(2, len(allowed))))
+
+    cap = max(2, min(10, int(settings.complexity_cap)))
+    chosen: List[EntryFilterType] = []
+    budget = cap
+    pool = list(allowed)
+    rng.shuffle(pool)
+
+    if settings.enable_regime_switching:
+        regime = [f for f in pool if f in _REGIME_FILTERS]
+        if regime:
+            f = rng.choice(regime)
+            chosen.append(f)
+            budget -= _COMPLEXITY_COST.get(f, 1)
+
+    if settings.enable_mtf_context and EntryFilterType.MTF_VOLATILITY in pool \
+            and EntryFilterType.MTF_VOLATILITY not in chosen:
+        cost = _COMPLEXITY_COST[EntryFilterType.MTF_VOLATILITY]
+        if budget - cost >= 0:
+            chosen.append(EntryFilterType.MTF_VOLATILITY)
+            budget -= cost
+
+    for ft in pool:
+        if ft in chosen:
+            continue
+        cost = _COMPLEXITY_COST.get(ft, 1)
+        if budget - cost < 0:
+            continue
+        chosen.append(ft)
+        budget -= cost
+        # anti-bloat: stop once we have enough expressive signal blocks
+        if len(chosen) >= 4 and budget <= 1:
+            break
+
+    return chosen[: max(1, len(chosen))] or [rng.choice(allowed)]
+
+
+def _apply_advanced_risk_profile(strat: StrategyDefinition, rng: random.Random,
+                                 settings: GenerationSettings) -> None:
+    if not settings.advanced_mode:
+        return
+    tm = strat.trade_mgmt
+    # Volatility targeting approximation using existing risk_% sizing controls.
+    if tm.lot_mode == LotMode.RISK_PERCENT:
+        tm.params["risk_percent"] = min(
+            max(tm.params.get("risk_percent", 1.0), 0.35),
+            1.5 if settings.enable_regime_switching else 1.8,
+        )
+    # Dynamic sizing guardrail for aggressive mechanics.
+    if strat.mechanic.type in (ExecutionMechanicType.DCA_GRID, ExecutionMechanicType.HEDGE_LAYER):
+        strat.risk.max_open_lots = min(strat.risk.max_open_lots, 2.5)
+    # Optional time-based exit proxy: force session windows for advanced mode.
+    if rng.random() < 0.35:
+        tm.time_filter = True
+        tm.params.setdefault("start_hour", 6.0)
+        tm.params.setdefault("end_hour", 20.0)
 
 
 def describe_rules(strategy: StrategyDefinition) -> str:
@@ -484,6 +627,13 @@ def describe_rules(strategy: StrategyDefinition) -> str:
             f"(SL {mp['sl_points']:.0f} pts)."
         )
     lines.extend(describe_trade_mgmt(strategy.trade_mgmt))
+    if strategy.profile.advanced_mode:
+        lines.append(
+            f"Advanced profile: complexity {strategy.profile.complexity_score}/"
+            f"{strategy.profile.complexity_cap}; regime switching "
+            f"{'on' if strategy.profile.regime_switching else 'off'}; "
+            f"MTF context {'on' if strategy.profile.mtf_context else 'off'}."
+        )
     return "\n".join(lines)
 
 
@@ -491,7 +641,8 @@ def random_strategy(symbol: str, timeframe: str,
                     rng: Optional[random.Random] = None,
                     generation: int = 0,
                     allowed_mechanics: Optional[Sequence[ExecutionMechanicType]] = None,
-                    allowed_tm_features: Optional[Sequence[str]] = None
+                    allowed_tm_features: Optional[Sequence[str]] = None,
+                    generation_settings: Optional[GenerationSettings] = None,
                     ) -> StrategyDefinition:
     """Build a random strategy.
 
@@ -501,12 +652,12 @@ def random_strategy(symbol: str, timeframe: str,
     adaptive SL, etc.) may be switched on; ``None`` allows all.
     """
     rng = rng or random.Random()
+    generation_settings = generation_settings or GenerationSettings()
     choices = [m for m in (allowed_mechanics or list(ExecutionMechanicType))
                if m in MECHANIC_PARAM_SPECS] or list(ExecutionMechanicType)
     mech_type = rng.choice(choices)
     compatible = LOGIC_MATRIX[mech_type]
-    n_filters = rng.randint(1, min(2, len(compatible)))
-    filter_types = rng.sample(compatible, n_filters)
+    filter_types = _pick_filter_pack(compatible, rng, generation_settings)
 
     filters = [
         EntryFilter(type=ft, params=_sample_params(FILTER_PARAM_SPECS[ft], rng),
@@ -522,6 +673,28 @@ def random_strategy(symbol: str, timeframe: str,
         mechanic=mechanic, risk=RiskBlock(),
         trade_mgmt=random_trade_mgmt(mech_type, rng, allowed_tm_features),
         lineage=Lineage(generation=generation),
+        profile=StrategyProfile(
+            advanced_mode=generation_settings.advanced_mode,
+            complexity_cap=(
+                max(2, int(generation_settings.complexity_cap))
+                if generation_settings.advanced_mode else 2
+            ),
+            regime_switching=bool(generation_settings.enable_regime_switching),
+            mtf_context=bool(generation_settings.enable_mtf_context),
+            feature_toggles=list(generation_settings.feature_toggles or []),
+        ),
+    )
+    _apply_advanced_risk_profile(strat, rng, generation_settings)
+    strat.profile.complexity_score = int(
+        sum(_COMPLEXITY_COST.get(f.type, 1) for f in strat.entry_filters)
+    )
+    strat.profile.portfolio_signature = "|".join(
+        [
+            strat.symbol,
+            strat.timeframe,
+            strat.mechanic.type.value,
+            ",".join(sorted(f.type.value for f in strat.entry_filters)),
+        ]
     )
     strat.name = f"{rng.choice(_ADJECTIVES)} {rng.choice(_NOUNS)} {strat.id[:6].upper()}"
     strat.magic_number = _MAGIC_BASE + int(strat.id[:6], 16) % 100000
@@ -551,6 +724,17 @@ def mutate(strategy: StrategyDefinition, rng: Optional[random.Random] = None,
                     mutations.append(f"{name}={new_val}")
     clone.lineage = Lineage(parents=[strategy.id], mutations=mutations,
                             generation=strategy.lineage.generation + 1)
+    clone.profile.complexity_score = int(
+        sum(_COMPLEXITY_COST.get(f.type, 1) for f in clone.entry_filters)
+    )
+    clone.profile.portfolio_signature = "|".join(
+        [
+            clone.symbol,
+            clone.timeframe,
+            clone.mechanic.type.value,
+            ",".join(sorted(f.type.value for f in clone.entry_filters)),
+        ]
+    )
     clone.name = strategy.name.rsplit(" ", 1)[0] + f" {clone.id[:6].upper()}"
     clone.magic_number = _MAGIC_BASE + int(clone.id[:6], 16) % 100000
     clone.rule_description = describe_rules(clone)
@@ -580,6 +764,18 @@ def crossover(a: StrategyDefinition, b: StrategyDefinition,
         trade_mgmt=a.trade_mgmt.model_copy(deep=True),
         lineage=Lineage(parents=[a.id, b.id],
                         generation=max(a.lineage.generation, b.lineage.generation) + 1),
+        profile=a.profile.model_copy(deep=True),
+    )
+    child.profile.complexity_score = int(
+        sum(_COMPLEXITY_COST.get(f.type, 1) for f in child.entry_filters)
+    )
+    child.profile.portfolio_signature = "|".join(
+        [
+            child.symbol,
+            child.timeframe,
+            child.mechanic.type.value,
+            ",".join(sorted(f.type.value for f in child.entry_filters)),
+        ]
     )
     child.name = f"{rng.choice(_ADJECTIVES)} {rng.choice(_NOUNS)} {child.id[:6].upper()}"
     child.magic_number = _MAGIC_BASE + int(child.id[:6], 16) % 100000

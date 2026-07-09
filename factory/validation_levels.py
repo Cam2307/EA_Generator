@@ -116,7 +116,9 @@ VALIDATION_LEVELS: List[ValidationLevel] = [
 
 MIN_LEVEL = VALIDATION_LEVELS[0].level
 MAX_LEVEL = VALIDATION_LEVELS[-1].level
-DEFAULT_LEVEL = 3
+# Default to a practical broad-net profile: keep gates meaningful but avoid
+# early over-pruning so users can rank more candidates in the gallery.
+DEFAULT_LEVEL = 2
 
 
 def get_level(level: int) -> ValidationLevel:

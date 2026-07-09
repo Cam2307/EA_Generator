@@ -60,11 +60,61 @@ data/ reports/ output/      Runtime artifacts (git-ignored)
   developed and demoed offline (clearly not market data — treat results as
   plumbing checks only).
 
-## Every parameter is optimizable — including execution mechanics
+## How strategies are generated, optimized, and scored
+
+Each strategy is a recipe built from three layers:
+
+### 1. How strategies are generated
+
+**Entry rules (when to trade).** The factory picks 1–2 indicators from the
+Logic Matrix (RSI, MA cross, breakout, Bollinger, etc.) and random values for
+their settings — e.g. RSI period 14, oversold level 25.
+
+**Exit style (how trades are managed).** One of four execution mechanics:
+
+| Mechanic | What it does |
+|----------|--------------|
+| **Standard SL/TP** | Fixed stop and take-profit in points |
+| **Partial close** | Take partial profit, move stop to breakeven |
+| **DCA / Grid** | Add positions as price moves against you |
+| **Hedge layer** | Open opposite position when underwater |
+
+**Trade-management overlay (optional).** On top of the mechanic, each strategy
+may also get adaptive or fixed stop loss, risk-reward take profit, trailing
+stop (fixed / ATR / chandelier), breakeven triggers, session filters, daily
+loss limits, and related controls.
+
+New strategies are built randomly, then the genetic loop keeps promising
+candidates and breeds better ones — mutating parameter values and combining
+entry filters from two parents across generations.
+
+### 2. What gets optimized (including SL distance)
+
+**Yes — stop and exit distances are both generated randomly and optimized.**
+
+For a standard SL/TP strategy, typical tunable parameters include:
+
+| Parameter | Typical range | Meaning |
+|-----------|---------------|---------|
+| `sl_points` | 100–600 pts | Fixed stop distance |
+| `tp_points` | 100–900 pts | Fixed take-profit distance |
+| `atr_sl_mult` | 1.0–4.0 | Adaptive SL: stop = ATR × multiplier |
+| `trail_distance_points` | 100–600 | Fixed trailing distance |
+| `trail_atr_mult` | 1.5–4.0 | ATR / chandelier trailing |
+| `be_trigger_points` | 100–500 | When to move stop to breakeven |
+| `tp_rr` | 1.0–4.0 | Take-profit as multiple of stop (R:R) |
+
+Entry-filter settings are tuned too (e.g. RSI period, MA fast/slow, lookback).
+
+**In-sample optimization** runs a random search over all of these ranges on
+the first ~70% of history. The winning combination is saved as `best_params`
+and exported in the `.set` file. If a strategy shows SL at 250 pts, that value
+was chosen by the optimizer from the allowed range for that run — not hard-coded.
 
 Entry-filter *and* execution-mechanic parameters (grid step spacing, grid
 level count, lot multiplier, hedge trigger distance in points, hedge ratio,
-partial-close level and fraction, SL/TP) all carry `min/max/step` ranges:
+partial-close level and fraction, SL/TP, trade-management `X_*` params) all
+carry `min/max/step` ranges:
 
 - the IS optimizer and walk-forward windows sweep them,
 - the genetic loop mutates and crosses them over,
@@ -72,6 +122,21 @@ partial-close level and fraction, SL/TP) all carry `min/max/step` ranges:
   `Inp_M_hedge_trigger_points`, ...),
 - tester `.ini` files and exported `.set` files carry them in the
   `Value||Start||Step||Stop||Y` optimizable format.
+
+### 3. How optimization scores strategies
+
+Both the genetic search and the in-sample optimizer share the same fitness
+objective — biased toward **stable, steadily rising equity curves**:
+
+```
+fitness = (net profit / (1 + drawdown%)) × smoothness
+```
+
+**Smoothness** is the equity-curve **R²** (how straight and steadily rising the
+curve is). A choppy but profitable curve scores lower than a smooth riser with
+similar profit. Neighborhood-stability scoring (see Validation gates below)
+further prefers parameter *plateaus* over isolated peaks when re-ranking top
+candidates.
 
 ## Validation gates
 

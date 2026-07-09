@@ -92,6 +92,11 @@ SYMBOLS = [
     "BTCUSD", "ETHUSD",
 ]
 
+# Discovery-agent defaults (persisted overrides live in SQLite app_settings).
+DEFAULT_ALERT_RECIPIENT = "camdwg@gmail.com"
+DEFAULT_ALERT_MIN_SCORE = 70.0
+DEFAULT_ALERT_COOLDOWN_MINUTES = 60
+
 
 def ensure_dirs() -> None:
     for d in (DATA_DIR, REPORTS_DIR, OUTPUT_DIR):

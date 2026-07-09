@@ -33,7 +33,13 @@ CREATE TABLE IF NOT EXISTS validations (
     wfe REAL,
     body TEXT NOT NULL,
     updated_at REAL,
-    job_id TEXT
+    job_id TEXT,
+    promotion_state TEXT,
+    quality_score REAL,
+    hard_gates_passed INTEGER NOT NULL DEFAULT 0,
+    quality_breakdown TEXT,
+    last_alert_at REAL,
+    alert_fingerprint TEXT
 );
 CREATE TABLE IF NOT EXISTS jobs (
     id TEXT PRIMARY KEY,
@@ -51,6 +57,33 @@ CREATE TABLE IF NOT EXISTS jobs (
     survivors INTEGER NOT NULL DEFAULT 0,
     generation INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at REAL
+);
+CREATE TABLE IF NOT EXISTS agent_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    enabled INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'stopped',
+    pid INTEGER,
+    heartbeat_at REAL,
+    queue_depth INTEGER NOT NULL DEFAULT 0,
+    jobs_submitted INTEGER NOT NULL DEFAULT 0,
+    cursor INTEGER NOT NULL DEFAULT 0,
+    updated_at REAL
+);
+CREATE TABLE IF NOT EXISTS strategy_metadata (
+    strategy_id TEXT PRIMARY KEY,
+    sweep_symbol TEXT,
+    sweep_timeframe TEXT,
+    strictness_profile TEXT,
+    seed INTEGER,
+    parameter_snapshot TEXT,
+    parent_id TEXT,
+    generation INTEGER,
+    updated_at REAL
+);
 """
 
 # Columns added after the original jobs table shipped; carried live during a
@@ -61,7 +94,15 @@ _JOB_COUNTER_COLUMNS = ("tested", "promising", "survivors", "generation")
 # Columns added to `validations` after it first shipped. `job_id` links every
 # result back to the discovery run that produced it, so the UI can show the
 # results of a single run.
-_VALIDATION_COLUMNS = (("job_id", "TEXT"),)
+_VALIDATION_COLUMNS = (
+    ("job_id", "TEXT"),
+    ("promotion_state", "TEXT"),
+    ("quality_score", "REAL"),
+    ("hard_gates_passed", "INTEGER NOT NULL DEFAULT 0"),
+    ("quality_breakdown", "TEXT"),
+    ("last_alert_at", "REAL"),
+    ("alert_fingerprint", "TEXT"),
+)
 
 
 class Storage:
@@ -118,7 +159,8 @@ class Storage:
 
     def save_complete(self, strategy: StrategyDefinition,
                       report: ValidationReport,
-                      job_id: Optional[str] = None) -> None:
+                      job_id: Optional[str] = None,
+                      metadata: Optional[dict] = None) -> None:
         """Atomically persist a strategy and its validation report.
 
         Every candidate that finishes (or aborts) the validation pipeline
@@ -142,6 +184,24 @@ class Storage:
                 (report.strategy_id, int(report.passed), report.wfe, body_v, now,
                  job_id),
             )
+            if metadata:
+                con.execute(
+                    "INSERT OR REPLACE INTO strategy_metadata "
+                    "(strategy_id, sweep_symbol, sweep_timeframe, strictness_profile, "
+                    " seed, parameter_snapshot, parent_id, generation, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        strategy.id,
+                        metadata.get("sweep_symbol"),
+                        metadata.get("sweep_timeframe"),
+                        metadata.get("strictness_profile"),
+                        metadata.get("seed"),
+                        json.dumps(metadata.get("parameter_snapshot", {})),
+                        metadata.get("parent_id"),
+                        metadata.get("generation"),
+                        now,
+                    ),
+                )
 
     def get_strategy(self, strategy_id: str) -> Optional[StrategyDefinition]:
         with self.connection() as con:
@@ -175,7 +235,10 @@ class Storage:
 
     def list_validated(self, passed_only: bool = True,
                        job_id: Optional[str] = None) -> List[ValidationReport]:
-        q = "SELECT body, job_id FROM validations"
+        q = (
+            "SELECT body, job_id, promotion_state, quality_score, hard_gates_passed, "
+            "quality_breakdown, last_alert_at, alert_fingerprint FROM validations"
+        )
         clauses, args = [], []
         if passed_only:
             clauses.append("passed=1")
@@ -200,7 +263,78 @@ class Storage:
         report = ValidationReport.model_validate_json(row["body"])
         keys = row.keys()
         report.run_id = row["job_id"] if "job_id" in keys else None
+        if "promotion_state" in keys and row["promotion_state"]:
+            report.promotion_state = row["promotion_state"]
+        if "quality_score" in keys and row["quality_score"] is not None:
+            report.quality_score = float(row["quality_score"])
+        if "hard_gates_passed" in keys:
+            report.hard_gates_passed = bool(row["hard_gates_passed"])
+        if "quality_breakdown" in keys and row["quality_breakdown"]:
+            try:
+                report.quality_breakdown = json.loads(row["quality_breakdown"])
+            except json.JSONDecodeError:
+                report.quality_breakdown = {}
         return report
+
+    def get_strategy_metadata(self, strategy_id: str) -> Optional[dict]:
+        with self.connection() as con:
+            row = con.execute(
+                "SELECT * FROM strategy_metadata WHERE strategy_id=?",
+                (strategy_id,),
+            ).fetchone()
+        if not row:
+            return None
+        out = dict(row)
+        if out.get("parameter_snapshot"):
+            try:
+                out["parameter_snapshot"] = json.loads(out["parameter_snapshot"])
+            except json.JSONDecodeError:
+                out["parameter_snapshot"] = {}
+        return out
+
+    def update_validation_promotion(
+        self,
+        strategy_id: str,
+        *,
+        promotion_state: str,
+        quality_score: float,
+        hard_gates_passed: bool,
+        quality_breakdown: Optional[dict] = None,
+    ) -> None:
+        with self.connection() as con:
+            con.execute(
+                "UPDATE validations SET promotion_state=?, quality_score=?, "
+                "hard_gates_passed=?, quality_breakdown=?, updated_at=? "
+                "WHERE strategy_id=?",
+                (
+                    promotion_state,
+                    float(quality_score),
+                    int(bool(hard_gates_passed)),
+                    json.dumps(quality_breakdown or {}),
+                    time.time(),
+                    strategy_id,
+                ),
+            )
+
+    def mark_alert_sent(self, strategy_id: str, fingerprint: str) -> None:
+        with self.connection() as con:
+            con.execute(
+                "UPDATE validations SET last_alert_at=?, alert_fingerprint=? WHERE strategy_id=?",
+                (time.time(), fingerprint, strategy_id),
+            )
+
+    def get_alert_state(self, strategy_id: str) -> dict:
+        with self.connection() as con:
+            row = con.execute(
+                "SELECT last_alert_at, alert_fingerprint FROM validations WHERE strategy_id=?",
+                (strategy_id,),
+            ).fetchone()
+        if not row:
+            return {"last_alert_at": None, "alert_fingerprint": None}
+        return {
+            "last_alert_at": row["last_alert_at"],
+            "alert_fingerprint": row["alert_fingerprint"],
+        }
 
     def count_validated(self, job_id: str) -> tuple[int, int]:
         """Return ``(passed, total)`` result counts for a single run."""
@@ -302,4 +436,62 @@ class Storage:
             promising=row["promising"] if "promising" in keys else 0,
             survivors=row["survivors"] if "survivors" in keys else 0,
             generation=row["generation"] if "generation" in keys else 0,
+        )
+
+    # ------------------------------------------------------------------
+    # App settings + discovery agent state
+    # ------------------------------------------------------------------
+    def get_app_settings(self) -> dict:
+        with self.connection() as con:
+            rows = con.execute("SELECT key, value FROM app_settings").fetchall()
+        out: dict = {}
+        for row in rows:
+            value = row["value"]
+            try:
+                out[row["key"]] = json.loads(value)
+            except (TypeError, json.JSONDecodeError):
+                out[row["key"]] = value
+        return out
+
+    def upsert_app_settings(self, values: dict) -> None:
+        now = time.time()
+        with self.connection() as con:
+            for key, value in values.items():
+                con.execute(
+                    "INSERT OR REPLACE INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)",
+                    (key, json.dumps(value), now),
+                )
+
+    def get_agent_state(self) -> dict:
+        with self.connection() as con:
+            self._ensure_agent_state_row(con)
+            row = con.execute("SELECT * FROM agent_state WHERE id=1").fetchone()
+        return dict(row) if row else {}
+
+    def update_agent_state(self, **fields) -> None:
+        if not fields:
+            return
+        fields["updated_at"] = time.time()
+        sets = ", ".join(f"{k}=?" for k in fields)
+        args = list(fields.values()) + [1]
+        with self.connection() as con:
+            self._ensure_agent_state_row(con)
+            con.execute(f"UPDATE agent_state SET {sets} WHERE id=?", args)
+
+    def upsert_agent_state(self, **fields) -> None:
+        """Compatibility alias for callers that expect an upsert method."""
+        self.update_agent_state(**fields)
+
+    def set_agent_state(self, **fields) -> None:
+        """Compatibility alias for legacy callers."""
+        self.update_agent_state(**fields)
+
+    @staticmethod
+    def _ensure_agent_state_row(con: sqlite3.Connection) -> None:
+        row = con.execute("SELECT id FROM agent_state WHERE id=1").fetchone()
+        if row:
+            return
+        con.execute(
+            "INSERT INTO agent_state (id, updated_at) VALUES (1, ?)",
+            (time.time(),),
         )

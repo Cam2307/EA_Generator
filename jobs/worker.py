@@ -29,7 +29,7 @@ from factory.backtest.simulator import SimulatorEngine, SymbolSpec
 from factory.backtest.validation import (
     default_criteria, quick_screen, screen_fitness, validate_strategy,
 )
-from factory.generator import evolve, random_strategy
+from factory.generator import GenerationSettings, evolve, random_strategy
 from factory.models import (
     AcceptanceCriteria, BacktestMetrics, ExecutionMechanicType, Job,
     JobCancelled, JobStatus, StrategyDefinition, ValidationReport,
@@ -91,6 +91,17 @@ def _spec_overrides_from_payload(payload: Dict) -> Dict[str, float]:
     return out
 
 
+def _generation_settings_from_payload(payload: Dict) -> GenerationSettings:
+    """Parse advanced-generation controls from the payload."""
+    return GenerationSettings(
+        advanced_mode=bool(payload.get("advanced_mode", False)),
+        complexity_cap=int(payload.get("complexity_cap", 4)),
+        enable_regime_switching=bool(payload.get("enable_regime_switching", False)),
+        enable_mtf_context=bool(payload.get("enable_mtf_context", False)),
+        feature_toggles=list(payload.get("feature_toggles") or []),
+    )
+
+
 def _aborted_validation_report(strategy: StrategyDefinition, engine: str,
                                exc: Exception) -> ValidationReport:
     """Build a failed report when the validation pipeline aborts mid-run."""
@@ -106,9 +117,10 @@ def _aborted_validation_report(strategy: StrategyDefinition, engine: str,
 
 def _persist_complete(storage: Storage, strategy: StrategyDefinition,
                       report: ValidationReport,
-                      job_id: Optional[str] = None) -> None:
+                      job_id: Optional[str] = None,
+                      metadata: Optional[Dict] = None) -> None:
     """Durably store a finished (pass or fail) validation result."""
-    storage.save_complete(strategy, report, job_id=job_id)
+    storage.save_complete(strategy, report, job_id=job_id, metadata=metadata)
 
 
 def _apply_spec_overrides(engine, spec_overrides: Dict[str, float]) -> None:
@@ -199,7 +211,20 @@ def _evaluate_candidate(task: Dict) -> Dict:
             data_source=task["data_source"], cancel_check=cancel_check,
             spec_overrides=spec_overrides)
         result["passed"] = report.passed
-        storage.save_complete(strat, report, job_id=task["job_id"])
+        storage.save_complete(
+            strat,
+            report,
+            job_id=task["job_id"],
+            metadata={
+                "sweep_symbol": task.get("sweep_symbol"),
+                "sweep_timeframe": task.get("sweep_timeframe"),
+                "strictness_profile": task.get("strictness_profile"),
+                "seed": task.get("seed"),
+                "parameter_snapshot": report.best_params,
+                "parent_id": (strat.lineage.parents[0] if strat.lineage.parents else None),
+                "generation": strat.lineage.generation,
+            },
+        )
         return result
     except JobCancelled:
         result["cancelled"] = True
@@ -208,7 +233,20 @@ def _evaluate_candidate(task: Dict) -> Dict:
         result["error"] = f"{type(exc).__name__}: {exc}"
         if result["promising"]:
             report = _aborted_validation_report(strat, "simulator", exc)
-            storage.save_complete(strat, report, job_id=task["job_id"])
+            storage.save_complete(
+                strat,
+                report,
+                job_id=task["job_id"],
+                metadata={
+                    "sweep_symbol": task.get("sweep_symbol"),
+                    "sweep_timeframe": task.get("sweep_timeframe"),
+                    "strictness_profile": task.get("strictness_profile"),
+                    "seed": task.get("seed"),
+                    "parameter_snapshot": {},
+                    "parent_id": (strat.lineage.parents[0] if strat.lineage.parents else None),
+                    "generation": strat.lineage.generation,
+                },
+            )
         return result
 
 
@@ -335,6 +373,7 @@ class JobQueue:
         use_genetic = bool(payload.get("genetic", True))
         allowed_mechanics = _mechanics_from_payload(payload)
         allowed_tm_features = _tm_features_from_payload(payload)
+        generation_settings = _generation_settings_from_payload(payload)
 
         start = datetime.fromisoformat(payload["start"]) if payload.get("start") \
             else datetime.now(timezone.utc) - timedelta(days=365)
@@ -416,21 +455,28 @@ class JobQueue:
             if generation == 0 or not (use_genetic and scored):
                 return [random_strategy(symbol, timeframe, rng,
                                         allowed_mechanics=allowed_mechanics,
-                                        allowed_tm_features=allowed_tm_features)
+                                        allowed_tm_features=allowed_tm_features,
+                                        generation_settings=generation_settings)
                         for _ in range(this_gen)]
             top = sorted(scored, key=lambda t: t[1], reverse=True)[:50]
             pop = evolve(top, this_gen, rng)
             n_fresh = max(1, this_gen // 5)      # fresh blood vs. convergence
             pop[:n_fresh] = [random_strategy(symbol, timeframe, rng,
                                              allowed_mechanics=allowed_mechanics,
-                                             allowed_tm_features=allowed_tm_features)
+                                             allowed_tm_features=allowed_tm_features,
+                                             generation_settings=generation_settings)
                              for _ in range(n_fresh)]
             return pop
 
         # Simulator work fans out across a process pool (parallel, off the UI
-        # thread). MT5 stays strictly sequential — one terminal, one run.
+        # thread). MT5 and non-simulator engines stay sequential.
+        #
+        # Test suites monkeypatch ``_make_engine`` with in-process stubs that
+        # track call counts / injected failures. Those stubs are not picklable
+        # across process boundaries, so parallel pool mode must only be used
+        # for the real SimulatorEngine.
         pool = None
-        if engine_name != "mt5":
+        if engine_name != "mt5" and isinstance(engine, SimulatorEngine):
             pool = ProcessPoolExecutor(max_workers=_discovery_pool_size(gen_size))
 
         def _make_task(strat) -> Dict:
@@ -441,6 +487,9 @@ class JobQueue:
                 "wfo_test": wfo_test, "wfo_n": wfo_n, "data_source": data_source,
                 "spec_overrides": spec_overrides, "seed": rng.randint(0, 2**31),
                 "db_path": str(self.storage.db_path), "job_id": job_id,
+                "sweep_symbol": payload.get("symbol"),
+                "sweep_timeframe": payload.get("timeframe"),
+                "strictness_profile": payload.get("strictness_profile", "normal"),
             }
 
         try:
@@ -453,7 +502,7 @@ class JobQueue:
                 population = _build_population(min(gen_size, remaining))
 
                 if pool is None:
-                    # -- MT5: strictly sequential, full pipeline per candidate --
+                    # -- Sequential lane: MT5 (always) and non-simulator stubs --
                     for strat in population:
                         if _cancelled_now():
                             _finish_cancelled()
@@ -463,8 +512,75 @@ class JobQueue:
                         tested += 1
                         _persist_progress()
                         engine_label = getattr(engine, "name", engine_name)
-                        try:
-                            with self._mt5_lane:
+                        if engine_name == "mt5":
+                            try:
+                                with self._mt5_lane:
+                                    report = validate_strategy(
+                                        engine, strat, start, end, deposit=deposit,
+                                        seed=rng.randint(0, 2**31), criteria=criteria,
+                                        run_montecarlo=run_mc, mc_config=mc_config,
+                                        wfo_train_months=wfo_train,
+                                        wfo_test_months=wfo_test, wfo_windows=wfo_n,
+                                        data_source=data_source,
+                                        cancel_check=cancel_check,
+                                        spec_overrides=spec_overrides)
+                            except JobCancelled:
+                                _finish_cancelled()
+                                return
+                            except Exception as exc:
+                                errors += 1
+                                report = _aborted_validation_report(
+                                    strat, engine_label, exc)
+                                _persist_complete(storage, strat, report,
+                                                  job_id=job_id,
+                                                  metadata={
+                                                      "sweep_symbol": payload.get("symbol"),
+                                                      "sweep_timeframe": payload.get("timeframe"),
+                                                      "strictness_profile": payload.get("strictness_profile", "normal"),
+                                                      "seed": payload.get("seed"),
+                                                      "parameter_snapshot": report.best_params,
+                                                      "parent_id": (strat.lineage.parents[0] if strat.lineage.parents else None),
+                                                      "generation": strat.lineage.generation,
+                                                  })
+                                storage.set_job_status(
+                                    job_id, JobStatus.RUNNING,
+                                    error=f"{type(exc).__name__}: {exc}")
+                            else:
+                                _persist_complete(storage, strat, report,
+                                                  job_id=job_id,
+                                                  metadata={
+                                                      "sweep_symbol": payload.get("symbol"),
+                                                      "sweep_timeframe": payload.get("timeframe"),
+                                                      "strictness_profile": payload.get("strictness_profile", "normal"),
+                                                      "seed": payload.get("seed"),
+                                                      "parameter_snapshot": report.best_params,
+                                                      "parent_id": (strat.lineage.parents[0] if strat.lineage.parents else None),
+                                                      "generation": strat.lineage.generation,
+                                                  })
+                            scored.append((strat, screen_fitness(report.oos_metrics)))
+                            if report.passed:
+                                survivors += 1
+                        else:
+                            # Non-MT5 sequential fallback mirrors pool semantics:
+                            # quick screen -> full validation only for promising.
+                            try:
+                                promising, m = quick_screen(
+                                    engine, strat, start, end, deposit, criteria)
+                            except JobCancelled:
+                                _finish_cancelled()
+                                return
+                            except Exception as exc:
+                                errors += 1
+                                storage.set_job_status(
+                                    job_id, JobStatus.RUNNING,
+                                    error=f"{type(exc).__name__}: {exc}")
+                                continue
+
+                            scored.append((strat, screen_fitness(m)))
+                            if not promising:
+                                continue
+                            screened_in += 1
+                            try:
                                 report = validate_strategy(
                                     engine, strat, start, end, deposit=deposit,
                                     seed=rng.randint(0, 2**31), criteria=criteria,
@@ -474,24 +590,41 @@ class JobQueue:
                                     data_source=data_source,
                                     cancel_check=cancel_check,
                                     spec_overrides=spec_overrides)
-                        except JobCancelled:
-                            _finish_cancelled()
-                            return
-                        except Exception as exc:
-                            errors += 1
-                            report = _aborted_validation_report(
-                                strat, engine_label, exc)
-                            _persist_complete(storage, strat, report,
-                                              job_id=job_id)
-                            storage.set_job_status(
-                                job_id, JobStatus.RUNNING,
-                                error=f"{type(exc).__name__}: {exc}")
-                        else:
-                            _persist_complete(storage, strat, report,
-                                              job_id=job_id)
-                        scored.append((strat, screen_fitness(report.oos_metrics)))
-                        if report.passed:
-                            survivors += 1
+                            except JobCancelled:
+                                _finish_cancelled()
+                                return
+                            except Exception as exc:
+                                errors += 1
+                                report = _aborted_validation_report(
+                                    strat, engine_label, exc)
+                                _persist_complete(storage, strat, report,
+                                                  job_id=job_id,
+                                                  metadata={
+                                                      "sweep_symbol": payload.get("symbol"),
+                                                      "sweep_timeframe": payload.get("timeframe"),
+                                                      "strictness_profile": payload.get("strictness_profile", "normal"),
+                                                      "seed": payload.get("seed"),
+                                                      "parameter_snapshot": report.best_params,
+                                                      "parent_id": (strat.lineage.parents[0] if strat.lineage.parents else None),
+                                                      "generation": strat.lineage.generation,
+                                                  })
+                                storage.set_job_status(
+                                    job_id, JobStatus.RUNNING,
+                                    error=f"{type(exc).__name__}: {exc}")
+                            else:
+                                _persist_complete(storage, strat, report,
+                                                  job_id=job_id,
+                                                  metadata={
+                                                      "sweep_symbol": payload.get("symbol"),
+                                                      "sweep_timeframe": payload.get("timeframe"),
+                                                      "strictness_profile": payload.get("strictness_profile", "normal"),
+                                                      "seed": payload.get("seed"),
+                                                      "parameter_snapshot": report.best_params,
+                                                      "parent_id": (strat.lineage.parents[0] if strat.lineage.parents else None),
+                                                      "generation": strat.lineage.generation,
+                                                  })
+                            if report.passed:
+                                survivors += 1
                         _persist_progress()
                 else:
                     # -- Simulator: evaluate the whole generation in parallel --

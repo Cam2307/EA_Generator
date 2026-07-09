@@ -203,10 +203,11 @@ def render_gallery(storage: Storage) -> None:
     with st.container(border=True):
         top_l, top_r = st.columns([3, 1], vertical_alignment="bottom")
         with top_l:
-            sort_by = render_sort_selectbox("gallery_sort", index=0)
+            default_sort_idx = SORT_OPTION_LABELS.index("Equity R² (high → low)")
+            sort_by = render_sort_selectbox("gallery_sort", index=default_sort_idx)
         with top_r:
             show_all = st.toggle(
-                "Include failed", value=False,
+                "Include failed", value=True,
                 help="Show candidates that did not clear every gate.")
 
         reports = storage.list_validated(passed_only=not show_all)
@@ -352,6 +353,9 @@ def render_strategy_card(strategy: StrategyDefinition,
 
         src_badge = data_source_badge(report.data_source)
         st.markdown(f"{badge} &nbsp; {src_badge}")
+        st.caption(
+            f"Promotion: {report.promotion_state} · quality score {report.quality_score:.1f}"
+        )
         if run_label:
             st.caption(f":material/tag: Run {run_label}")
         st.caption(
@@ -454,6 +458,7 @@ def _render_compact_card(strategy: StrategyDefinition,
     with st.container(border=True):
         st.markdown(f"##### {strategy.name}")
         st.markdown(f"{badge} &nbsp; {data_source_badge(report.data_source)}")
+        st.caption(f"Promotion: {report.promotion_state} · score {report.quality_score:.1f}")
         if run_label:
             st.caption(f":material/tag: Run {run_label}")
         st.caption(f"{strategy.symbol} · {strategy.timeframe} · {report.engine} · "

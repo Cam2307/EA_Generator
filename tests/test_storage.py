@@ -68,3 +68,34 @@ def test_list_validated_includes_failed(temp_db: Path) -> None:
 
     assert len(storage.list_validated(passed_only=True)) == 1
     assert len(storage.list_validated(passed_only=False)) == 2
+
+
+def test_agent_state_aliases_and_upsert(temp_db: Path) -> None:
+    storage = Storage(temp_db)
+
+    # Start from a clean state row and verify defaults exist.
+    initial = storage.get_agent_state()
+    assert initial["id"] == 1
+    assert "status" in initial
+
+    # Modern API.
+    storage.update_agent_state(enabled=1, status="running", queue_depth=3)
+    state = storage.get_agent_state()
+    assert int(state["enabled"]) == 1
+    assert state["status"] == "running"
+    assert int(state["queue_depth"]) == 3
+
+    # Backward-compatible aliases.
+    storage.upsert_agent_state(status="stopping")
+    storage.set_agent_state(status="stopped", enabled=0)
+    state = storage.get_agent_state()
+    assert state["status"] == "stopped"
+    assert int(state["enabled"]) == 0
+
+
+def test_app_settings_persist_recipient_email(temp_db: Path) -> None:
+    storage = Storage(temp_db)
+    storage.upsert_app_settings({"recipient_email": "alerts@example.com"})
+
+    restored = Storage(temp_db).get_app_settings()
+    assert restored["recipient_email"] == "alerts@example.com"
