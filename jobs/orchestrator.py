@@ -1,7 +1,6 @@
 """Long-running discovery orchestrator independent from Streamlit lifecycle."""
 from __future__ import annotations
 
-import hashlib
 import os
 import subprocess
 import sys
@@ -9,46 +8,247 @@ import time
 from pathlib import Path
 
 from config import settings
-from factory.alerts import send_email
-from factory.promotion import evaluate_promotion
+from factory.agent_alerts import (
+    maybe_send_progress_digest,
+    maybe_send_quality_alerts,
+    sync_promotion_scores,
+)
+from factory.discovery_config import (
+    DiscoverySettings,
+    build_discovery_payload,
+    settings_from_app,
+)
 from factory.storage import Storage
 from jobs.sweep import plan_sweeps
-from jobs.worker import get_job_queue
+from jobs.worker import _pid_alive, get_job_queue
 
 LOCK_PATH = settings.DATA_DIR / "discovery_orchestrator.lock"
+ERROR_LOG_PATH = settings.DATA_DIR / "discovery_agent_error.log"
 SERVICE_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "discovery_agent_service.py"
+_STARTING_STALE_SECONDS = 5
+_RECOVER_RETRY_SECONDS = 15
+_MAX_RECOVER_SPAWNS = 5
 
 
-def start_orchestrator_process() -> bool:
-    """Spawn detached orchestrator process; returns False if already running."""
-    if LOCK_PATH.exists():
+def _python_executable() -> str:
+    """Launch with the same interpreter that hosts the dashboard (venv-aware)."""
+    exe = Path(sys.executable)
+    if exe.stem.lower() == "streamlit":
+        venv_py = exe.with_name("python.exe")
+        if venv_py.exists():
+            return str(venv_py)
+        root_py = exe.parent.parent / "python.exe"
+        if root_py.exists():
+            return str(root_py)
+    # Prefer the active interpreter — in a venv this is .../Scripts/python.exe
+    # and includes project dependencies. sys._base_executable is the system
+    # Python outside the venv and often lacks numpy/streamlit/etc.
+    return str(exe)
+
+
+def _windows_subprocess_flags(*, detached: bool = False) -> int:
+    """Hide console windows when spawning subprocesses on Windows."""
+    if os.name != "nt":
+        return 0
+    flags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
+    if detached:
+        flags |= (
+            subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+            | subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
+        )
+    return flags
+
+
+def _read_lock_pid() -> int:
+    if not LOCK_PATH.exists():
+        return 0
+    try:
+        raw = LOCK_PATH.read_text(encoding="utf-8").strip()
+        return int(raw) if raw else 0
+    except (OSError, ValueError):
+        return 0
+
+
+def clear_stale_orchestrator_lock() -> bool:
+    """Remove a lock left behind by a dead orchestrator process."""
+    if not LOCK_PATH.exists():
         return False
-    flags = 0
-    if os.name == "nt":
-        flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
-    subprocess.Popen(  # noqa: S603
-        [sys.executable, str(SERVICE_SCRIPT)],
-        cwd=str(Path(__file__).resolve().parents[1]),
-        creationflags=flags,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+    pid = _read_lock_pid()
+    if pid > 0 and _pid_alive(pid):
+        return False
+    try:
+        LOCK_PATH.unlink(missing_ok=True)
+    except OSError:
+        return False
+    return True
+
+
+def _startup_error_detail() -> str:
+    if not ERROR_LOG_PATH.exists():
+        return ""
+    try:
+        text = ERROR_LOG_PATH.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+    if not text:
+        return ""
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    return lines[-1] if lines else ""
+
+
+def sync_agent_with_orchestrator_lock(storage: Storage | None = None) -> bool:
+    """Promote agent_state to running when the lock is held by a live process."""
+    store = storage or Storage()
+    pid = _read_lock_pid()
+    if pid <= 0 or not _pid_alive(pid):
+        return False
+    state = store.get_agent_state()
+    if not bool(state.get("enabled", 0)):
+        return False
+    if str(state.get("status") or "") == "running" and int(state.get("pid") or 0) == pid:
+        return True
+    store.update_agent_state(
+        enabled=1,
+        status="running",
+        pid=pid,
+        spawn_attempts=0,
+        message=str(state.get("message") or "Discovery agent running"),
     )
     return True
 
 
+def start_orchestrator_process() -> bool:
+    """Spawn detached orchestrator process; returns False if already running."""
+    if sync_agent_with_orchestrator_lock():
+        return True
+    clear_stale_orchestrator_lock()
+    if LOCK_PATH.exists():
+        return sync_agent_with_orchestrator_lock()
+    ERROR_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    err_log = open(ERROR_LOG_PATH, "ab")  # noqa: SIM115 - inherited by child briefly
+    subprocess.Popen(  # noqa: S603
+        [_python_executable(), str(SERVICE_SCRIPT)],
+        cwd=str(Path(__file__).resolve().parents[1]),
+        creationflags=_windows_subprocess_flags(detached=True),
+        stdout=subprocess.DEVNULL,
+        stderr=err_log,
+        close_fds=False,
+    )
+    err_log.close()
+    return True
+
+
+def recover_stuck_starting_agent(storage: Storage | None = None) -> bool:
+    """Retry spawn when the UI enabled the agent but no live process took over."""
+    store = storage or Storage()
+    if sync_agent_with_orchestrator_lock(store):
+        return True
+    state = store.get_agent_state()
+    if not bool(state.get("enabled", 0)):
+        return False
+    if str(state.get("status") or "") != "starting":
+        return False
+    pid = int(state.get("pid") or 0)
+    if pid > 0 and _pid_alive(pid):
+        return False
+    now = time.time()
+    updated = float(state.get("updated_at") or 0)
+    # A fresh click with no pid yet gets a short grace period for spawn.
+    if pid <= 0 and updated and (now - updated) < _STARTING_STALE_SECONDS:
+        return False
+    detail = _startup_error_detail()
+    if detail and not LOCK_PATH.exists():
+        store.update_agent_state(
+            enabled=0,
+            status="stopped",
+            pid=None,
+            message=f"Discovery agent failed to start: {detail}",
+        )
+        clear_stale_orchestrator_lock()
+        return False
+    attempts = int(state.get("spawn_attempts") or 0)
+    if attempts >= _MAX_RECOVER_SPAWNS:
+        store.update_agent_state(
+            enabled=0,
+            status="stopped",
+            pid=None,
+            message=(
+                "Discovery agent failed to start after several attempts. "
+                "Stop any stale process, then try again."
+                + (f" Last error: {detail}" if detail else "")
+            ),
+        )
+        clear_stale_orchestrator_lock()
+        return False
+    # Rate-limit recovery so the live-status poll cannot spawn every 2s.
+    if attempts > 0 and updated and (now - updated) < _RECOVER_RETRY_SECONDS:
+        return False
+    clear_stale_orchestrator_lock()
+    spawned = start_orchestrator_process()
+    store.update_agent_state(
+        updated_at=now,
+        spawn_attempts=attempts + 1,
+    )
+    sync_agent_with_orchestrator_lock(store)
+    return spawned
+
+
 def stop_orchestrator_process() -> None:
+    """Disable agent, cancel discovery jobs immediately, force-kill in background.
+
+    DB updates happen on the caller thread so the UI can clear Active runs on
+    the next fragment poll. ``taskkill`` / SIGTERM runs in a daemon thread so
+    Streamlit is never blocked waiting on process teardown.
+    """
+    import threading
+
     storage = Storage()
     state = storage.get_agent_state()
-    pid = state.get("pid")
-    storage.update_agent_state(enabled=0, status="stopping")
-    if pid:
+    pid = int(state.get("pid") or 0) or _read_lock_pid()
+    storage.update_agent_state(
+        enabled=0,
+        status="stopping",
+        message="Stop requested — cancelling jobs and stopping agent",
+    )
+    storage.cancel_active_discovery_jobs(
+        message="Cancelled — agent stop requested",
+    )
+
+    def _force_stop(target_pid: int) -> None:
         try:
-            if os.name == "nt":
-                subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], check=False)  # noqa: S603,S607
-            else:
-                os.kill(int(pid), 15)
+            if target_pid:
+                if os.name == "nt":
+                    subprocess.run(  # noqa: S603,S607
+                        ["taskkill", "/PID", str(target_pid), "/T", "/F"],
+                        check=False,
+                        creationflags=_windows_subprocess_flags(),
+                    )
+                else:
+                    try:
+                        os.kill(int(target_pid), 15)
+                    except ProcessLookupError:
+                        pass
         except Exception:
             pass
+        clear_stale_orchestrator_lock()
+        try:
+            store = Storage()
+            store.update_agent_state(
+                enabled=0,
+                status="stopped",
+                pid=None,
+                current_job_id=None,
+                message="Agent stopped",
+            )
+        except Exception:
+            pass
+
+    threading.Thread(
+        target=_force_stop,
+        args=(pid,),
+        daemon=True,
+        name="orchestrator-stop",
+    ).start()
 
 
 class OrchestratorSingleton:
@@ -67,136 +267,133 @@ class OrchestratorSingleton:
         return False
 
 
-def run_orchestrator_forever(sleep_seconds: int = 5) -> None:
+def run_orchestrator_forever(sleep_seconds: int = 2) -> None:
     storage = Storage()
     queue = get_job_queue()
-    with OrchestratorSingleton():
-        storage.update_agent_state(enabled=1, status="running", pid=os.getpid())
-        while True:
-            cfg = _load_agent_config(storage)
-            if not cfg["enabled"]:
-                storage.update_agent_state(status="stopped", heartbeat_at=time.time(), pid=None)
-                break
-            _tick(storage, queue, cfg)
-            time.sleep(sleep_seconds)
+    try:
+        with OrchestratorSingleton():
+            storage.update_agent_state(enabled=1, status="running", pid=os.getpid())
+            while True:
+                cfg = _load_discovery_config(storage)
+                if not cfg["enabled"]:
+                    storage.update_agent_state(
+                        status="stopped",
+                        heartbeat_at=time.time(),
+                        pid=None,
+                        message="Stopped",
+                        current_job_id=None,
+                    )
+                    break
+                _tick(storage, queue, cfg)
+                time.sleep(sleep_seconds)
+    except FileExistsError:
+        if sync_agent_with_orchestrator_lock(storage):
+            return
+        raise
 
 
-def _load_agent_config(storage: Storage) -> dict:
+def _load_discovery_config(storage: Storage) -> dict:
     app = storage.get_app_settings()
+    discovery = settings_from_app(app)
+    state = storage.get_agent_state()
     return {
-        "enabled": bool(storage.get_agent_state().get("enabled", 0)),
-        "symbols": app.get("agent_symbols", settings.SYMBOLS[:5]),
-        "timeframes": app.get("agent_timeframes", ["M15", "H1"]),
-        "strictness_profiles": app.get("agent_strictness_profiles", ["easy", "normal", "hard", "custom"]),
-        "months": int(app.get("agent_history_months", 12)),
-        "batch_size": int(app.get("agent_batch_size", 100)),
-        "max_candidates": int(app.get("agent_max_candidates", 1000)),
-        "target_survivors": int(app.get("agent_target_survivors", 2)),
-        "cooldown_minutes": int(app.get("alert_cooldown_minutes", 60)),
-        "alert_min_score": float(app.get("alert_min_score", 70.0)),
-        "recipient_email": str(app.get("recipient_email", "camdwg@gmail.com")),
-        "custom_criteria": app.get("agent_custom_criteria", {}),
-        "base_seed": int(app.get("agent_base_seed", 1337)),
-        "advanced_mode": bool(app.get("agent_advanced_mode", True)),
-        "complexity_cap": int(app.get("agent_complexity_cap", 6)),
-        "enable_regime_switching": bool(app.get("agent_enable_regime_switching", True)),
-        "enable_mtf_context": bool(app.get("agent_enable_mtf_context", True)),
-        "feature_toggles": app.get(
-            "agent_feature_toggles",
-            ["momentum", "mean_reversion", "volatility", "market_structure"],
-        ),
+        "enabled": bool(state.get("enabled", 0)),
+        "mode": str(state.get("mode") or "continuous"),
+        "discovery": discovery,
+        "alert_min_score": discovery.alert_min_score,
+        "progress_email_hours": discovery.progress_email_hours,
+        "recipient_email": discovery.recipient_email,
     }
 
 
 def _tick(storage: Storage, queue, cfg: dict) -> None:
+    discovery: DiscoverySettings = cfg["discovery"]
     jobs = storage.list_jobs("discovery")
     active = [j for j in jobs if j.status.value in ("PENDING", "RUNNING")]
     state = storage.get_agent_state()
     cursor = int(state.get("cursor", 0) or 0)
+    mode = str(cfg.get("mode") or "continuous")
     plans = plan_sweeps(
-        symbols=list(cfg["symbols"]),
-        timeframes=list(cfg["timeframes"]),
-        strictness_profiles=list(cfg["strictness_profiles"]),
-        months=cfg["months"],
-        base_seed=cfg["base_seed"],
-        custom_criteria=cfg["custom_criteria"],
+        symbols=list(discovery.symbols),
+        timeframes=list(discovery.timeframes),
+        months=discovery.months,
+        base_seed=discovery.base_seed,
     )
-    if plans and len(active) == 0:
+    sweep_total = len(plans)
+    agent_updates: dict = {
+        "status": "running",
+        "heartbeat_at": time.time(),
+        "queue_depth": len(active),
+        "pid": os.getpid(),
+        "sweep_total": sweep_total,
+        "mode": mode,
+    }
+    if active:
+        job = active[0]
+        sweep_idx = max(cursor - 1, 0) % sweep_total if sweep_total else 0
+        plan = plans[sweep_idx] if plans else None
+        agent_updates["current_job_id"] = job.id
+        if plan is not None:
+            sweep_label = f"{plan.symbol} · {plan.timeframe}"
+            job_detail = job.message or job.status.value.lower()
+            agent_updates["message"] = f"Running sweep — {sweep_label} — {job_detail}"
+        else:
+            agent_updates["message"] = job.message or "Running discovery sweep"
+    elif plans:
         plan = plans[cursor % len(plans)]
-        payload = {
-            "engine": settings.DEFAULT_ENGINE,
-            "batch_size": cfg["batch_size"],
-            "target_survivors": cfg["target_survivors"],
-            "max_candidates": cfg["max_candidates"],
-            "genetic": True,
-            "seed": int(plan.seed),
-            "advanced_mode": cfg["advanced_mode"],
-            "complexity_cap": cfg["complexity_cap"],
-            "enable_regime_switching": cfg["enable_regime_switching"],
-            "enable_mtf_context": cfg["enable_mtf_context"],
-            "feature_toggles": list(cfg["feature_toggles"]),
-            **plan.payload_patch,
-        }
-        job_id = f"auto_{int(time.time())}_{cursor % len(plans):03d}"
-        queue.submit_discovery(job_id, payload)
-        storage.update_agent_state(cursor=cursor + 1, jobs_submitted=int(state.get("jobs_submitted", 0)) + 1)
-    storage.update_agent_state(status="running", heartbeat_at=time.time(), queue_depth=len(active), pid=os.getpid())
+        agent_updates["current_job_id"] = None
+        agent_updates["message"] = (
+            f"Idle — next sweep: {plan.symbol} · {plan.timeframe}"
+        )
+    else:
+        agent_updates["current_job_id"] = None
+        agent_updates["message"] = "No sweeps configured — check symbols/timeframes"
+
+    if plans and len(active) == 0:
+        if mode == "batch" and cursor >= len(plans):
+            agent_updates["enabled"] = 0
+            agent_updates["status"] = "stopped"
+            agent_updates["message"] = (
+                f"Batch complete — {len(plans)} sweeps finished"
+            )
+        else:
+            plan = plans[cursor % len(plans)]
+            payload = build_discovery_payload(
+                discovery,
+                symbol=plan.symbol,
+                timeframe=plan.timeframe,
+                seed=plan.seed,
+            )
+            job_id = f"auto_{int(time.time())}_{cursor % len(plans):03d}"
+            queue.submit_discovery(job_id, payload)
+            storage.update_agent_state(
+                cursor=cursor + 1,
+                jobs_submitted=int(state.get("jobs_submitted", 0)) + 1,
+            )
+            agent_updates["current_job_id"] = job_id
+            agent_updates["message"] = (
+                f"Submitted sweep — {plan.symbol} · {plan.timeframe}"
+            )
+    storage.update_agent_state(**agent_updates)
     _run_alert_pass(storage, cfg)
 
 
 def _run_alert_pass(storage: Storage, cfg: dict) -> None:
-    recipient = cfg["recipient_email"].strip()
+    """Refresh promotion scores, email exceptional EAs once, and hourly progress."""
+    state = storage.get_agent_state()
+    now = time.time()
+    last_sync = float(state.get("last_promotion_sync_at") or 0)
+    if now - last_sync >= 60:
+        sync_promotion_scores(storage)
+        storage.update_agent_state(last_promotion_sync_at=now)
+    recipient = str(cfg["recipient_email"]).strip()
     if not recipient:
         return
-    cooldown = max(1, int(cfg["cooldown_minutes"])) * 60
-    min_score = float(cfg["alert_min_score"])
-    reports = storage.list_validated(passed_only=False)
-    signatures: dict[str, int] = {}
-    report_sig: dict[str, str] = {}
-    for rep in reports:
-        strat = storage.get_strategy(rep.strategy_id)
-        sig = ""
-        if strat is not None and strat.profile.portfolio_signature:
-            sig = strat.profile.portfolio_signature
-        report_sig[rep.strategy_id] = sig
-        if sig:
-            signatures[sig] = signatures.get(sig, 0) + 1
-
-    for report in reports:
-        sig = report_sig.get(report.strategy_id, "")
-        duplicate_penalty = 0.0
-        if sig and signatures.get(sig, 0) > 1:
-            duplicate_penalty = min(10.0, (signatures[sig] - 1) * 3.0)
-        decision = evaluate_promotion(report, duplicate_penalty=duplicate_penalty)
-        storage.update_validation_promotion(
-            report.strategy_id,
-            promotion_state=decision.promotion_state,
-            quality_score=decision.quality_score,
-            hard_gates_passed=decision.hard_gates_passed,
-            quality_breakdown=decision.breakdown,
-        )
-        if not decision.hard_gates_passed or decision.quality_score < min_score:
-            continue
-        alert_state = storage.get_alert_state(report.strategy_id)
-        now = time.time()
-        last_sent = float(alert_state.get("last_alert_at") or 0.0)
-        fingerprint = hashlib.sha1(
-            f"{decision.promotion_state}|{round(decision.quality_score, 2)}".encode("utf-8")
-        ).hexdigest()
-        if alert_state.get("alert_fingerprint") == fingerprint and now - last_sent < cooldown:
-            continue
-        subject = f"EA discovery alert: {decision.promotion_state}"
-        body = (
-            f"Strategy: {report.strategy_id}\n"
-            f"Promotion: {decision.promotion_state}\n"
-            f"Quality score: {decision.quality_score:.2f}\n"
-            f"WFE: {report.wfe:.2f}\n"
-            f"OOS PF: {report.oos_metrics.profit_factor:.2f}\n"
-            f"OOS Sharpe: {report.oos_metrics.sharpe:.2f}\n"
-        )
-        try:
-            send_email(recipient, subject, body)
-            storage.mark_alert_sent(report.strategy_id, fingerprint=fingerprint)
-        except Exception:
-            # Keep orchestrator resilient if SMTP is unavailable.
-            continue
+    maybe_send_quality_alerts(
+        storage, recipient=recipient, min_score=cfg["alert_min_score"]
+    )
+    maybe_send_progress_digest(
+        storage,
+        recipient=recipient,
+        progress_email_hours=cfg["progress_email_hours"],
+    )

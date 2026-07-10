@@ -419,5 +419,6 @@ class Job(BaseModel):
     promising: int = 0                 # candidates promoted to full validation
     survivors: int = 0                 # strategies passing every gate
     generation: int = 0                # current evolution round
+    runner_pid: Optional[int] = None   # process executing this job (cross-process safety)
     created_at: float = Field(default_factory=time.time)
     updated_at: float = Field(default_factory=time.time)

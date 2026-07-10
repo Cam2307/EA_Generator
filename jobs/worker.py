@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import os
+import pickle
 import random
 import threading
 import time
@@ -151,7 +152,13 @@ def _apply_spec_overrides(engine, spec_overrides: Dict[str, float]) -> None:
 def _discovery_pool_size(gen_size: int) -> int:
     """Worker count: use most cores but leave one for the UI, capped sanely."""
     cores = os.cpu_count() or 2
-    return max(1, min(cores - 1, 8, gen_size))
+    return max(1, min(cores - 1, 16, gen_size))
+
+
+def _pool_worker_init(ohlc_blob: bytes) -> None:
+    """Share the preloaded discovery OHLC range with a pool worker process."""
+    symbol, timeframe, df = pickle.loads(ohlc_blob)
+    data_mod.register_range_cache(symbol, timeframe, df)
 
 
 def _pool_cancel_check(db_path, job_id: str) -> Callable[[], bool]:
@@ -259,22 +266,45 @@ class JobQueue:
         self._submitted: Dict[str, bool] = {}
         self._submit_lock = threading.Lock()
         self._reconcile_orphaned_jobs()
+        self._resume_pending_jobs()
 
     def _reconcile_orphaned_jobs(self) -> None:
-        """Close out jobs left ``PENDING``/``RUNNING`` by a previous process.
+        """Close out jobs left ``RUNNING`` by a dead process.
 
         Workers are threads inside this process, so a shutdown/restart kills
-        them mid-run while their SQLite row stays ``RUNNING``. A freshly built
-        queue has no in-flight work by definition, so any such row is an orphan
-        with no thread behind it — which is exactly what makes a stuck
-        "Cancelling…" hang forever (nothing is left to honour the flag). Mark
-        them ``CANCELLED`` so the UI reflects reality and the slot frees up.
+        them mid-run while their SQLite row stays ``RUNNING``. Only cancel a
+        row when its ``runner_pid`` is missing or no longer alive — never
+        touch jobs actively executed by another live process (e.g. the detached
+        discovery orchestrator).
         """
         for job in self.storage.list_jobs():
-            if job.status in (JobStatus.PENDING, JobStatus.RUNNING):
-                self.storage.set_job_status(
-                    job.id, JobStatus.CANCELLED,
-                    message="stopped — interrupted by an app restart")
+            if job.status != JobStatus.RUNNING:
+                continue
+            pid = job.runner_pid
+            if pid and _pid_alive(int(pid)):
+                continue
+            self.storage.set_job_status(
+                job.id, JobStatus.CANCELLED,
+                message="stopped — interrupted by an app restart")
+            self.storage.set_job_runner(job.id, None)
+
+    def _resume_pending_jobs(self) -> None:
+        """Pick up discovery jobs queued while this process was down."""
+        if self._has_live_running_job():
+            return
+        for job in reversed(self.storage.list_jobs("discovery")):
+            if job.status != JobStatus.PENDING or job.cancel_requested:
+                continue
+            self.submit_discovery(job.id, job.payload)
+            break
+
+    def _has_live_running_job(self) -> bool:
+        for job in self.storage.list_jobs("discovery"):
+            if job.status != JobStatus.RUNNING:
+                continue
+            if job.runner_pid and _pid_alive(int(job.runner_pid)):
+                return True
+        return False
 
     # ------------------------------------------------------------------
     # Submission (idempotent by job id)
@@ -328,6 +358,7 @@ class JobQueue:
             self.storage.set_job_status(job_id, JobStatus.FAILED,
                                         error=traceback.format_exc())
         finally:
+            self.storage.set_job_runner(job_id, None)
             with self._submit_lock:
                 self._submitted.pop(job_id, None)
 
@@ -357,6 +388,7 @@ class JobQueue:
         job = storage.get_job(job_id)
         payload = job.payload
         storage.set_job_status(job_id, JobStatus.RUNNING, message="starting")
+        storage.set_job_runner(job_id, os.getpid())
 
         symbol = payload.get("symbol", settings.DEFAULT_SYMBOL)
         timeframe = payload.get("timeframe", settings.DEFAULT_TIMEFRAME)
@@ -405,12 +437,10 @@ class JobQueue:
         wfo_train = int(payload.get("wfo_train_months", settings.WFO_TRAIN_MONTHS))
         wfo_test = int(payload.get("wfo_test_months", settings.WFO_TEST_MONTHS))
         wfo_n = int(payload.get("wfo_windows", settings.WFO_WINDOWS))
-        data_source = payload.get("data_source")
-        if not data_source:
-            try:
-                data_source = data_mod.peek_source(symbol, timeframe, start, end)
-            except Exception:
-                data_source = "unknown"
+        full_ohlc = data_mod.load_ohlc(symbol, timeframe, start, end)
+        data_mod.register_range_cache(symbol, timeframe, full_ohlc)
+        data_source = str(payload.get("data_source") or full_ohlc.attrs.get("source", "unknown"))
+        ohlc_blob = pickle.dumps((symbol, timeframe, full_ohlc))
 
         rng = random.Random(seed)
         engine = self._make_engine(engine_name)
@@ -427,15 +457,24 @@ class JobQueue:
         errors = 0
         scored: list = []     # (strategy, screen_fitness) for genetic evolution
         generation = 0
+        persist_state = {"ts": 0.0, "tested": 0}
 
         def _progress_msg() -> str:
             return (f"tested {tested}/{max_candidates} · promising {screened_in}"
                     f" · survivors {survivors}/{target_survivors}"
                     f" · gen {generation}")
 
-        def _persist_progress() -> None:
-            """Write the current live counters so the 2s UI fragment reflects
-            them mid-run. Progress blends candidate budget with survivor target."""
+        def _persist_progress(*, force: bool = False) -> None:
+            """Write live counters for the UI without hammering SQLite."""
+            now = time.monotonic()
+            if (not force and tested == persist_state["tested"]
+                    and now - persist_state["ts"] < 2.0):
+                return
+            if (not force and tested - persist_state["tested"] < 5
+                    and now - persist_state["ts"] < 2.0):
+                return
+            persist_state["ts"] = now
+            persist_state["tested"] = tested
             frac = max(tested / max_candidates,
                        survivors / max(target_survivors, 1))
             storage.update_job_progress(
@@ -460,7 +499,7 @@ class JobQueue:
                         for _ in range(this_gen)]
             top = sorted(scored, key=lambda t: t[1], reverse=True)[:50]
             pop = evolve(top, this_gen, rng)
-            n_fresh = max(1, this_gen // 5)      # fresh blood vs. convergence
+            n_fresh = max(1, this_gen // 3)      # fresh blood vs. convergence
             pop[:n_fresh] = [random_strategy(symbol, timeframe, rng,
                                              allowed_mechanics=allowed_mechanics,
                                              allowed_tm_features=allowed_tm_features,
@@ -477,7 +516,11 @@ class JobQueue:
         # for the real SimulatorEngine.
         pool = None
         if engine_name != "mt5" and isinstance(engine, SimulatorEngine):
-            pool = ProcessPoolExecutor(max_workers=_discovery_pool_size(gen_size))
+            pool = ProcessPoolExecutor(
+                max_workers=_discovery_pool_size(gen_size),
+                initializer=_pool_worker_init,
+                initargs=(ohlc_blob,),
+            )
 
         def _make_task(strat) -> Dict:
             return {
@@ -667,8 +710,9 @@ class JobQueue:
         finally:
             if pool is not None:
                 pool.shutdown(wait=False, cancel_futures=True)
+            data_mod.clear_range_cache()
 
-        total_passing = len(self.storage.list_validated(passed_only=True))
+        total_passing = self.storage.count_validated(passed_only=True)
         storage.update_job_progress(
             job_id, 1.0,
             f"done — {_progress_msg()} ({total_passing} passing in library)",
@@ -683,6 +727,25 @@ class JobQueue:
 
 _queue_lock = threading.Lock()
 _queue: Optional[JobQueue] = None
+
+
+def _pid_alive(pid: int) -> bool:
+    """Return True when ``pid`` still refers to a live OS process."""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if handle:
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return True
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
 
 
 def get_job_queue() -> JobQueue:

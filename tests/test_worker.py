@@ -9,6 +9,7 @@ from typing import Dict, Optional
 
 import pytest
 
+from config import settings
 from factory.backtest.base import BacktestEngine
 from factory.backtest.validation import validate_strategy
 from factory.models import (
@@ -262,7 +263,7 @@ def test_month_based_wfo_windows():
     assert report.wfo_train_months == 2
     assert report.wfo_test_months == 1
     span = rolling[0].oos_end_ts - rolling[0].oos_start_ts
-    assert span == pytest.approx(1 * 30.4375 * 86400, rel=0.02)
+    assert span == pytest.approx(1 * settings.DAYS_PER_MONTH * 86400, rel=0.02)
 
 
 def _minimal_strategy() -> StrategyDefinition:

@@ -17,125 +17,125 @@ from factory.models import (
 
 FILTER_PARAM_SPECS: Dict[EntryFilterType, Dict[str, ParamRange]] = {
     EntryFilterType.PRICE_ACTION_BREAKOUT: {
-        "lookback": ParamRange(min=10, max=60, step=5),
-        "buffer_points": ParamRange(min=0, max=50, step=5),
+        "lookback": ParamRange(min=10, max=60, step=2),
+        "buffer_points": ParamRange(min=0, max=50, step=2),
     },
     EntryFilterType.MTF_VOLATILITY: {
-        "atr_period": ParamRange(min=7, max=28, step=7),
-        "atr_mult_min": ParamRange(min=0.5, max=1.5, step=0.25),
+        "atr_period": ParamRange(min=7, max=28, step=1),
+        "atr_mult_min": ParamRange(min=0.5, max=1.5, step=0.1),
     },
     EntryFilterType.LIQUIDITY_ZONE: {
-        "zone_lookback": ParamRange(min=20, max=100, step=10),
-        "zone_points": ParamRange(min=10, max=100, step=10),
+        "zone_lookback": ParamRange(min=20, max=100, step=5),
+        "zone_points": ParamRange(min=10, max=100, step=5),
     },
     EntryFilterType.RSI_REVERSION: {
-        "rsi_period": ParamRange(min=7, max=21, step=7),
-        "oversold": ParamRange(min=20, max=35, step=5),
-        "overbought": ParamRange(min=65, max=80, step=5),
+        "rsi_period": ParamRange(min=7, max=21, step=1),
+        "oversold": ParamRange(min=20, max=35, step=1),
+        "overbought": ParamRange(min=65, max=80, step=1),
     },
     EntryFilterType.MA_CROSS: {
-        "fast_period": ParamRange(min=5, max=20, step=5),
-        "slow_period": ParamRange(min=30, max=100, step=10),
+        "fast_period": ParamRange(min=5, max=20, step=1),
+        "slow_period": ParamRange(min=30, max=100, step=2),
     },
     EntryFilterType.BOLLINGER_FADE: {
-        "bb_period": ParamRange(min=14, max=28, step=7),
-        "bb_dev": ParamRange(min=1.5, max=3.0, step=0.5),
+        "bb_period": ParamRange(min=14, max=28, step=1),
+        "bb_dev": ParamRange(min=1.5, max=3.0, step=0.25),
     },
     EntryFilterType.MACD_CROSS: {
-        "fast_ema": ParamRange(min=8, max=16, step=2),
-        "slow_ema": ParamRange(min=20, max=40, step=4),
-        "signal_period": ParamRange(min=6, max=12, step=3),
+        "fast_ema": ParamRange(min=8, max=16, step=1),
+        "slow_ema": ParamRange(min=20, max=40, step=2),
+        "signal_period": ParamRange(min=6, max=12, step=1),
     },
     EntryFilterType.STOCHASTIC: {
-        "k_period": ParamRange(min=5, max=21, step=2),
-        "oversold": ParamRange(min=15, max=30, step=5),
-        "overbought": ParamRange(min=70, max=85, step=5),
+        "k_period": ParamRange(min=5, max=21, step=1),
+        "oversold": ParamRange(min=15, max=30, step=1),
+        "overbought": ParamRange(min=70, max=85, step=1),
     },
     EntryFilterType.ADX_TREND: {
-        "adx_period": ParamRange(min=10, max=28, step=2),
+        "adx_period": ParamRange(min=10, max=28, step=1),
         "adx_min": ParamRange(min=18, max=35, step=1),
     },
     EntryFilterType.CCI_REVERSION: {
-        "cci_period": ParamRange(min=10, max=30, step=2),
-        "cci_level": ParamRange(min=80, max=200, step=20),
+        "cci_period": ParamRange(min=10, max=30, step=1),
+        "cci_level": ParamRange(min=80, max=200, step=10),
     },
     EntryFilterType.MOMENTUM: {
-        "mom_period": ParamRange(min=8, max=24, step=2),
-        "mom_threshold": ParamRange(min=0.05, max=0.5, step=0.05),
+        "mom_period": ParamRange(min=8, max=24, step=1),
+        "mom_threshold": ParamRange(min=0.05, max=0.5, step=0.025),
     },
     EntryFilterType.WILLIAMS_R: {
-        "wpr_period": ParamRange(min=7, max=28, step=7),
-        "wpr_oversold": ParamRange(min=-90, max=-70, step=5),
-        "wpr_overbought": ParamRange(min=-30, max=-10, step=5),
+        "wpr_period": ParamRange(min=7, max=28, step=1),
+        "wpr_oversold": ParamRange(min=-90, max=-70, step=2),
+        "wpr_overbought": ParamRange(min=-30, max=-10, step=2),
     },
     EntryFilterType.VOLUME_SURGE: {
-        "vol_period": ParamRange(min=10, max=50, step=5),
-        "vol_mult": ParamRange(min=1.2, max=3.0, step=0.2),
+        "vol_period": ParamRange(min=10, max=50, step=2),
+        "vol_mult": ParamRange(min=1.2, max=3.0, step=0.1),
     },
     EntryFilterType.PARABOLIC_SAR: {
-        "sar_step": ParamRange(min=0.01, max=0.05, step=0.01),
-        "sar_max": ParamRange(min=0.1, max=0.4, step=0.1),
+        "sar_step": ParamRange(min=0.01, max=0.05, step=0.005),
+        "sar_max": ParamRange(min=0.1, max=0.4, step=0.05),
     },
     EntryFilterType.ICHIMOKU: {
-        "tenkan": ParamRange(min=6, max=12, step=3),
-        "kijun": ParamRange(min=22, max=34, step=4),
-        "senkou": ParamRange(min=44, max=68, step=8),
+        "tenkan": ParamRange(min=6, max=12, step=1),
+        "kijun": ParamRange(min=22, max=34, step=2),
+        "senkou": ParamRange(min=44, max=68, step=4),
     },
     EntryFilterType.DEMARKER: {
-        "dem_period": ParamRange(min=7, max=28, step=7),
-        "dem_oversold": ParamRange(min=0.2, max=0.35, step=0.05),
-        "dem_overbought": ParamRange(min=0.65, max=0.8, step=0.05),
+        "dem_period": ParamRange(min=7, max=28, step=1),
+        "dem_oversold": ParamRange(min=0.2, max=0.35, step=0.025),
+        "dem_overbought": ParamRange(min=0.65, max=0.8, step=0.025),
     },
     EntryFilterType.AWESOME: {
         "ao_threshold": ParamRange(min=0.0, max=0.0, step=0.0),
     },
     EntryFilterType.FORCE_INDEX: {
-        "force_period": ParamRange(min=8, max=26, step=2),
+        "force_period": ParamRange(min=8, max=26, step=1),
     },
     EntryFilterType.STDDEV_REGIME: {
-        "std_period": ParamRange(min=10, max=40, step=5),
-        "std_mult": ParamRange(min=1.0, max=2.5, step=0.25),
+        "std_period": ParamRange(min=10, max=40, step=2),
+        "std_mult": ParamRange(min=1.0, max=2.5, step=0.1),
     },
     EntryFilterType.ENVELOPES: {
-        "env_period": ParamRange(min=14, max=40, step=2),
-        "env_deviation": ParamRange(min=0.05, max=0.5, step=0.05),
+        "env_period": ParamRange(min=14, max=40, step=1),
+        "env_deviation": ParamRange(min=0.05, max=0.5, step=0.025),
     },
     EntryFilterType.MFI: {
-        "mfi_period": ParamRange(min=7, max=28, step=7),
-        "mfi_oversold": ParamRange(min=15, max=30, step=5),
-        "mfi_overbought": ParamRange(min=70, max=85, step=5),
+        "mfi_period": ParamRange(min=7, max=28, step=1),
+        "mfi_oversold": ParamRange(min=15, max=30, step=1),
+        "mfi_overbought": ParamRange(min=70, max=85, step=1),
     },
     EntryFilterType.RVI: {
-        "rvi_period": ParamRange(min=6, max=20, step=2),
+        "rvi_period": ParamRange(min=6, max=20, step=1),
     },
     EntryFilterType.DEMA_CROSS: {
-        "dema_fast": ParamRange(min=8, max=20, step=2),
-        "dema_slow": ParamRange(min=30, max=80, step=10),
+        "dema_fast": ParamRange(min=8, max=20, step=1),
+        "dema_slow": ParamRange(min=30, max=80, step=2),
     },
 }
 
 MECHANIC_PARAM_SPECS: Dict[ExecutionMechanicType, Dict[str, ParamRange]] = {
     ExecutionMechanicType.STANDARD_SLTP: {
-        "sl_points": ParamRange(min=100, max=600, step=50),
-        "tp_points": ParamRange(min=100, max=900, step=50),
+        "sl_points": ParamRange(min=80, max=600, step=20),
+        "tp_points": ParamRange(min=80, max=900, step=20),
     },
     ExecutionMechanicType.DCA_GRID: {
-        "grid_step_points": ParamRange(min=100, max=500, step=50),
-        "lot_multiplier": ParamRange(min=1.0, max=2.0, step=0.25),
+        "grid_step_points": ParamRange(min=80, max=500, step=20),
+        "lot_multiplier": ParamRange(min=1.0, max=2.0, step=0.1),
         "max_levels": ParamRange(min=2, max=6, step=1),
-        "basket_tp_points": ParamRange(min=50, max=300, step=25),
+        "basket_tp_points": ParamRange(min=50, max=300, step=10),
     },
     ExecutionMechanicType.HEDGE_LAYER: {
-        "sl_points": ParamRange(min=200, max=800, step=100),
-        "tp_points": ParamRange(min=200, max=800, step=100),
-        "hedge_trigger_points": ParamRange(min=100, max=400, step=50),
-        "hedge_ratio": ParamRange(min=0.5, max=1.5, step=0.25),
+        "sl_points": ParamRange(min=150, max=800, step=25),
+        "tp_points": ParamRange(min=150, max=800, step=25),
+        "hedge_trigger_points": ParamRange(min=80, max=400, step=20),
+        "hedge_ratio": ParamRange(min=0.5, max=1.5, step=0.1),
     },
     ExecutionMechanicType.PARTIAL_CLOSE: {
-        "sl_points": ParamRange(min=100, max=600, step=50),
-        "tp_points": ParamRange(min=200, max=900, step=50),
-        "partial_tp_points": ParamRange(min=50, max=400, step=50),
-        "partial_fraction": ParamRange(min=0.25, max=0.75, step=0.25),
+        "sl_points": ParamRange(min=80, max=600, step=20),
+        "tp_points": ParamRange(min=150, max=900, step=20),
+        "partial_tp_points": ParamRange(min=40, max=400, step=20),
+        "partial_fraction": ParamRange(min=0.25, max=0.75, step=0.05),
     },
 }
 
@@ -424,7 +424,7 @@ def _pick_filter_pack(
         allowed = list(compatible)
 
     if not settings.advanced_mode:
-        return rng.sample(allowed, rng.randint(1, min(2, len(allowed))))
+        return rng.sample(allowed, rng.randint(1, min(3, len(allowed))))
 
     cap = max(2, min(10, int(settings.complexity_cap)))
     chosen: List[EntryFilterType] = []
@@ -755,7 +755,7 @@ def crossover(a: StrategyDefinition, b: StrategyDefinition,
     seen: Dict[EntryFilterType, EntryFilter] = {}
     for f in pool:
         seen.setdefault(f.type, f)
-    chosen = list(seen.values())[: max(1, min(2, len(seen)))]
+    chosen = list(seen.values())[: max(1, min(3, len(seen)))]
 
     child = StrategyDefinition(
         symbol=a.symbol, timeframe=a.timeframe,

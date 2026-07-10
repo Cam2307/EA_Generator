@@ -12,10 +12,12 @@ Design rules (see plan):
 """
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
 import threading
+import time
 import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -25,9 +27,41 @@ from typing import Dict, Optional
 
 from config import settings
 from factory.backtest.base import BacktestEngine
-from factory.models import BacktestMetrics, ParamRange, StrategyDefinition
+from factory.models import BacktestMetrics, JobCancelled, ParamRange, StrategyDefinition
 
 _MT5_LOCK = threading.Lock()   # hard guarantee: one terminal at a time
+_CANCEL_POLL_SECONDS = 0.5
+
+
+def _subprocess_kwargs() -> dict:
+    """Suppress flashing console windows for helper commands on Windows."""
+    if os.name != "nt":
+        return {}
+    return {"creationflags": subprocess.CREATE_NO_WINDOW}  # type: ignore[attr-defined]
+
+
+def _terminate_process_tree(proc: subprocess.Popen) -> None:
+    """Best-effort kill of an MT5 tester process (and children on Windows)."""
+    if proc.poll() is not None:
+        return
+    try:
+        if os.name == "nt" and proc.pid:
+            subprocess.run(  # noqa: S603,S607
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                check=False,
+                **_subprocess_kwargs(),
+            )
+        else:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
 
 TIMEFRAME_TO_PERIOD = {
     "M1": "M1", "M5": "M5", "M15": "M15", "M30": "M30",
@@ -102,6 +136,7 @@ def _terminal_running() -> bool:
         out = subprocess.run(
             ["tasklist", "/FI", "IMAGENAME eq terminal64.exe", "/FO", "CSV"],
             capture_output=True, text=True, timeout=15,
+            **_subprocess_kwargs(),
         ).stdout
     except Exception:
         return False
@@ -281,8 +316,12 @@ class MT5Runner(BacktestEngine):
         log_path = dest.with_suffix(".log")
         cmd = [str(paths.metaeditor_exe), f"/compile:{dest}", f"/log:{log_path}"]
         try:
-            subprocess.run(cmd, timeout=settings.MT5_COMPILE_TIMEOUT_SECONDS,
-                           capture_output=True)
+            subprocess.run(
+                cmd,
+                timeout=settings.MT5_COMPILE_TIMEOUT_SECONDS,
+                capture_output=True,
+                **_subprocess_kwargs(),
+            )
         except subprocess.TimeoutExpired as exc:
             raise MT5RunnerError(f"MetaEditor compile timed out for {dest.name}") from exc
 
@@ -351,22 +390,44 @@ class MT5Runner(BacktestEngine):
                 "need exclusive use of the terminal data directory.")
 
         cmd = [str(paths.terminal_exe), f"/config:{ini_path}"]
+        cancel_check = getattr(self, "_cancel_check", None)
+        returncode = 0
         with _MT5_LOCK:                     # strictly sequential MT5 execution
+            proc = subprocess.Popen(  # noqa: S603
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                **_subprocess_kwargs(),
+            )
+            deadline = time.monotonic() + float(settings.MT5_RUN_TIMEOUT_SECONDS)
             try:
-                proc = subprocess.run(
-                    cmd, timeout=settings.MT5_RUN_TIMEOUT_SECONDS,
-                    capture_output=True,
-                )
-            except subprocess.TimeoutExpired as exc:
-                raise MT5RunnerError(
-                    f"MT5 tester run timed out after "
-                    f"{settings.MT5_RUN_TIMEOUT_SECONDS}s for {expert}") from exc
+                while True:
+                    ret = proc.poll()
+                    if ret is not None:
+                        returncode = int(ret)
+                        break
+                    if cancel_check is not None and cancel_check():
+                        _terminate_process_tree(proc)
+                        raise JobCancelled()
+                    if time.monotonic() >= deadline:
+                        _terminate_process_tree(proc)
+                        raise MT5RunnerError(
+                            f"MT5 tester run timed out after "
+                            f"{settings.MT5_RUN_TIMEOUT_SECONDS}s for {expert}")
+                    time.sleep(_CANCEL_POLL_SECONDS)
+            except JobCancelled:
+                raise
+            except MT5RunnerError:
+                raise
+            except Exception:
+                _terminate_process_tree(proc)
+                raise
         # MT5 may exit non-zero even on success; the report is the truth.
         try:
             metrics = parse_xml_report(report_path)
         except MT5RunnerError as exc:
             raise MT5RunnerError(
-                f"{exc} (terminal exit code {proc.returncode})") from exc
+                f"{exc} (terminal exit code {returncode})") from exc
         finally:
             ini_path.unlink(missing_ok=True)
 

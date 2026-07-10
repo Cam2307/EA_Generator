@@ -20,7 +20,6 @@ st.set_page_config(
     layout="wide",
 )
 
-# toolbarMode=minimal hides Deploy / Stop / menu; collapse the leftover bar.
 st.markdown(
     """
     <style>
@@ -33,9 +32,29 @@ st.markdown(
     header[data-testid="stHeader"] [data-testid="stToolbar"] {
         display: none !important;
     }
+    .ea-page-title {
+        margin: 0 0 0.2rem;
+        font-size: 1.65rem;
+        font-weight: 700;
+        color: #E8EAED;
+        letter-spacing: -0.02em;
+    }
+    .ea-page-sub {
+        margin: 0 0 1.25rem;
+        font-size: 0.9rem;
+        color: #8B95A5;
+        line-height: 1.55;
+        max-width: 46rem;
+    }
     </style>
     """,
     unsafe_allow_html=True,
+)
+
+_NAV_OPTIONS = (
+    ":material/radar: Discovery",
+    ":material/grid_view: Strategy gallery",
+    ":material/download: Export",
 )
 
 
@@ -55,33 +74,39 @@ def main() -> None:
     queue = get_queue()
     storage = get_storage()
 
-    st.title("MQL5 EA Factory & Curation Dashboard")
-    st.caption(
-        "Generate, backtest, validate, curate, and export MetaTrader 5 "
-        "Expert Advisors. The simulator engine is a pre-filter; final "
-        "verification always belongs to the real MT5 Strategy Tester."
+    st.markdown(
+        '<p class="ea-page-title">'
+        ':material/precision_manufacturing: MQL5 EA Factory</p>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        '<p class="ea-page-sub">Generate, backtest, validate, curate, and export '
+        "MetaTrader 5 Expert Advisors. The simulator is a pre-filter — final "
+        "verification belongs in the real MT5 Strategy Tester.</p>",
+        unsafe_allow_html=True,
     )
 
-    from app.components.discovery_panel import render_discovery_panel
-    from app.components.export_panel import render_export_panel
-    from app.components.strategy_card import render_gallery
+    # Segmented control (not st.tabs): hidden tabs still execute their bodies
+    # on every rerun, so Gallery/Export would deserialize the full validation
+    # library whenever Discovery start/stop triggered a rerun.
+    view = st.segmented_control(
+        "Section",
+        options=list(_NAV_OPTIONS),
+        default=_NAV_OPTIONS[0],
+        key="main_nav_section",
+        label_visibility="collapsed",
+    )
 
-    tab_discover, tab_gallery, tab_export = st.tabs([
-        ":material/search: Discovery",
-        ":material/grid_view: Strategy gallery",
-        ":material/download: Export",
-    ])
-
-    with tab_discover:
+    if view == _NAV_OPTIONS[0] or view is None:
+        from app.components.discovery_panel import render_discovery_panel
         render_discovery_panel(queue, storage)
-    with tab_gallery:
+    elif view == _NAV_OPTIONS[1]:
+        from app.components.strategy_card import render_gallery
         render_gallery(storage)
-    with tab_export:
+    elif view == _NAV_OPTIONS[2]:
+        from app.components.export_panel import render_export_panel
         render_export_panel(storage)
 
 
-# Guard so process-pool workers (spawned for parallel backtests) never re-run
-# the dashboard: a multiprocessing child imports this module as "__mp_main__",
-# while Streamlit runs it as "__main__".
 if __name__ == "__main__":
     main()

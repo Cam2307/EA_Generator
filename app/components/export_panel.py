@@ -8,6 +8,20 @@ from factory.assets.exporter import export_marketplace_package
 from factory.storage import Storage
 
 
+def _selected_strategy_ids() -> list[str]:
+    """Collect gallery checkbox selections from session state (no DB load)."""
+    ids: list[str] = []
+    for key, value in st.session_state.items():
+        if not value:
+            continue
+        if key.startswith("select_") and not key.startswith("select_gallery"):
+            # Gallery keys are ``select_{strategy_id}`` (see strategy_card).
+            sid = key[len("select_"):]
+            if sid:
+                ids.append(sid)
+    return ids
+
+
 def render_export_panel(storage: Storage) -> None:
     st.subheader("Export Marketplace Packages")
     st.caption(
@@ -16,9 +30,7 @@ def render_export_panel(storage: Storage) -> None:
         "and the marketplace .md description into "
         f"`{settings.OUTPUT_DIR}`.")
 
-    reports = storage.list_validated(passed_only=False)
-    selected_ids = [r.strategy_id for r in reports
-                    if st.session_state.get(f"select_{r.strategy_id}")]
+    selected_ids = _selected_strategy_ids()
 
     if not selected_ids:
         st.info("Select strategies in the Strategy Gallery tab first.")

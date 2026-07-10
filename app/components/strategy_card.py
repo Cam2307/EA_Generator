@@ -87,6 +87,18 @@ def _zip_dir(folder) -> bytes:
 
 # Compact modal grid: two columns × four rows keeps Plotly work bounded.
 _MODAL_PAGE_SIZE = 8
+# Full gallery grid: three columns × four rows; full bodies load for this page only.
+_GALLERY_PAGE_SIZE = 12
+# Safety cap when listing summaries (filters/sort still apply in Python after).
+_GALLERY_SUMMARY_CAP = 500
+
+
+def _hydrate_reports(storage: Storage, summaries: list) -> list:
+    """Load full ValidationReport bodies for the visible page only."""
+    ids = [s.strategy_id for s in summaries]
+    full = storage.get_validations(ids)
+    # Preserve summary order.
+    return [full[sid] for sid in ids if sid in full]
 
 
 def _run_created_at(report: ValidationReport, runs: dict | None) -> float:
@@ -192,31 +204,52 @@ def _chart_cache_key(report: ValidationReport) -> str:
 
 
 def render_gallery(storage: Storage) -> None:
-    st.subheader("Surviving strategies")
+    st.subheader("Strategy gallery")
 
-    # Load once: a strategy map avoids a per-card DB round-trip and powers the
-    # symbol filter without extra queries. The run map lets each card show which
-    # discovery run produced it (id + start time).
-    strategies = {s.id: s for s in storage.list_strategies()}
+    view = st.segmented_control(
+        "View",
+        options=["Library", "Results per run"],
+        default="Library",
+        key="gallery_view_mode",
+        help="Library shows all survivors with filters. Results per run "
+             "lets you inspect one discovery batch at a time.",
+    )
+    if view == "Results per run":
+        from app.components.run_view import render_per_run_section
+        render_per_run_section(storage)
+        return
+
+    st.markdown("#### Surviving strategies")
+
+    # Lightweight index only — never deserialize full strategy/validation bodies
+    # for the whole library up front.
+    strategy_index = {s.id: s for s in storage.list_strategy_summaries()}
     runs = {j.id: j for j in storage.list_jobs("discovery")}
+    page_key = "gallery_lib_page"
 
     with st.container(border=True):
         top_l, top_r = st.columns([3, 1], vertical_alignment="bottom")
         with top_l:
             default_sort_idx = SORT_OPTION_LABELS.index("Equity R² (high → low)")
-            sort_by = render_sort_selectbox("gallery_sort", index=default_sort_idx)
+            sort_by = render_sort_selectbox(
+                "gallery_sort", index=default_sort_idx, page_key=page_key)
         with top_r:
             show_all = st.toggle(
-                "Include failed", value=True,
-                help="Show candidates that did not clear every gate.")
+                "Include failed", value=False,
+                help="Show candidates that did not clear every gate. "
+                     "Off by default to keep the library fast.")
 
-        reports = storage.list_validated(passed_only=not show_all)
+        summaries = storage.list_validation_summaries(
+            passed_only=None if show_all else True,
+            limit=_GALLERY_SUMMARY_CAP,
+        )
 
         # Build filter option lists from what's actually present.
-        symbols = sorted({strategies[r.strategy_id].symbol
-                          for r in reports if r.strategy_id in strategies})
-        engines = sorted({r.engine for r in reports if r.engine})
-        sources = sorted({r.data_source for r in reports if r.data_source})
+        symbols = sorted({strategy_index[r.strategy_id].symbol
+                          for r in summaries if r.strategy_id in strategy_index
+                          and strategy_index[r.strategy_id].symbol})
+        engines = sorted({r.engine for r in summaries if r.engine})
+        sources = sorted({r.data_source for r in summaries if r.data_source})
 
         f1, f2, f3 = st.columns(3)
         with f1:
@@ -240,7 +273,7 @@ def render_gallery(storage: Storage) -> None:
             min_wfe = st.number_input("Min WFE", 0.0, 5.0, 0.0, step=0.05)
 
     def _keep(r) -> bool:
-        strat = strategies.get(r.strategy_id)
+        strat = strategy_index.get(r.strategy_id)
         if pick_symbols and (strat is None or strat.symbol not in pick_symbols):
             return False
         if pick_engines and r.engine not in pick_engines:
@@ -251,11 +284,11 @@ def render_gallery(storage: Storage) -> None:
         return (m.net_profit >= min_profit and m.profit_factor >= min_pf
                 and m.sharpe >= min_sharpe and r.wfe >= min_wfe)
 
-    filtered = [r for r in reports if _keep(r)]
-    total = len(reports)
+    filtered = [r for r in summaries if _keep(r)]
+    total = len(summaries)
     filtered = sort_reports(filtered, sort_by, runs=runs)
 
-    if not reports:
+    if not summaries:
         st.info("Nothing here yet. Run a discovery batch first — survivors "
                 "appear automatically.")
         return
@@ -264,9 +297,24 @@ def render_gallery(storage: Storage) -> None:
                    f"more (of {total} total).")
         return
 
-    st.caption(f"Showing {len(filtered)} of {total} result"
-               f"{'s' if total != 1 else ''}.")
-    render_report_grid(filtered, strategies, runs=runs)
+    if total >= _GALLERY_SUMMARY_CAP:
+        st.caption(
+            f"Showing top {_GALLERY_SUMMARY_CAP} by WFE "
+            f"({'all' if show_all else 'passed only'}). "
+            f"Use filters or Results per run for narrower sets.")
+    else:
+        st.caption(f"Showing {len(filtered)} of {total} result"
+                   f"{'s' if total != 1 else ''}.")
+
+    page_summaries, page, total_pages = _page_slice(
+        filtered, page_key, _GALLERY_PAGE_SIZE)
+    render_page_controls(
+        page_key, page, total_pages, len(filtered), _GALLERY_PAGE_SIZE,
+        control_key="gallery_lib_nav")
+
+    page_reports = _hydrate_reports(storage, page_summaries)
+    page_strategies = _strategies_for_reports(storage, page_reports, {})
+    render_report_grid(page_reports, page_strategies, runs=runs)
 
 
 def render_report_grid(reports: list, strategies: dict, runs: dict | None = None,

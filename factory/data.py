@@ -25,12 +25,43 @@ TIMEFRAME_MINUTES = {
 # each time dominates runtime, so cache the parsed DataFrame in memory. Callers
 # treat the frame as read-only.
 _MEM_CACHE: dict = {}
-_MEM_CACHE_MAX = 8
+_MEM_CACHE_MAX = 32
+
+# Full-range bars keyed by (symbol, timeframe). WFO/IS windows slice from this
+# instead of reloading parquet or re-querying MT5 for every sub-range.
+_RANGE_CACHE: dict[tuple[str, str], pd.DataFrame] = {}
 
 
 def _cache_path(symbol: str, timeframe: str, start: datetime, end: datetime):
     key = f"{symbol}_{timeframe}_{start:%Y%m%d}_{end:%Y%m%d}"
     return settings.DATA_DIR / f"ohlc_{key}.parquet"
+
+
+def _utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def register_range_cache(symbol: str, timeframe: str, df: pd.DataFrame) -> None:
+    """Pin the full discovery range for fast in-memory slicing."""
+    _RANGE_CACHE[(symbol.upper(), timeframe)] = df
+
+
+def clear_range_cache() -> None:
+    _RANGE_CACHE.clear()
+
+
+def _slice_df(df: pd.DataFrame, start: datetime, end: datetime) -> pd.DataFrame:
+    start, end = _utc(start), _utc(end)
+    times = pd.to_datetime(df["time"], utc=True)
+    mask = (times >= pd.Timestamp(start)) & (times <= pd.Timestamp(end))
+    out = df.loc[mask]
+    if out.empty:
+        return out
+    sliced = out.copy()
+    sliced.attrs = dict(getattr(df, "attrs", {}))
+    return sliced
 
 
 def _try_mt5(symbol: str, timeframe: str, start: datetime, end: datetime) -> Optional[pd.DataFrame]:
@@ -59,22 +90,21 @@ def _try_mt5(symbol: str, timeframe: str, start: datetime, end: datetime) -> Opt
 
 
 def synthetic_ohlc(symbol: str, timeframe: str, start: datetime, end: datetime) -> pd.DataFrame:
-    """Deterministic random-walk OHLC (seeded by symbol) for offline development."""
+    """Deterministic random-walk OHLC (seeded by symbol + range) for offline development."""
     minutes = TIMEFRAME_MINUTES[timeframe]
-    if start.tzinfo is None:
-        start = start.replace(tzinfo=timezone.utc)
-    if end.tzinfo is None:
-        end = end.replace(tzinfo=timezone.utc)
+    start, end = _utc(start), _utc(end)
     idx = pd.date_range(start, end, freq=f"{minutes}min", tz="utc")
     n = len(idx)
     if n < 2:
         raise ValueError("Date range too short for the requested timeframe")
 
-    seed = int(hashlib.sha256(f"{symbol}_{timeframe}".encode()).hexdigest()[:8], 16)
+    # Include the date window in the seed so different test durations produce
+    # distinct synthetic paths (not just a longer prefix of the same walk).
+    seed_key = f"{symbol}_{timeframe}_{start:%Y%m%d}_{end:%Y%m%d}"
+    seed = int(hashlib.sha256(seed_key.encode()).hexdigest()[:8], 16)
     rng = np.random.default_rng(seed)
 
     base = 1.1000 if symbol.upper().endswith("USD") else 100.0
-    # mildly mean-reverting walk with regime shifts so filters have something to bite on
     vol = 0.0004 * base
     drift = np.zeros(n)
     regime_len = max(200, n // 12)
@@ -99,15 +129,22 @@ def synthetic_ohlc(symbol: str, timeframe: str, start: datetime, end: datetime) 
 
 def load_ohlc(symbol: str, timeframe: str, start: datetime, end: datetime,
               allow_synthetic: bool = True) -> pd.DataFrame:
-    """Load bars, preferring an in-memory memo, then parquet cache, then live
-    MT5, then synthetic."""
+    """Load bars, preferring range cache slices, in-memory memo, parquet, MT5,
+    then synthetic."""
     settings.ensure_dirs()
-    mem_key = (symbol, timeframe, start.isoformat(), end.isoformat())
+    mem_key = (symbol, timeframe, _utc(start).isoformat(), _utc(end).isoformat())
     cached = _MEM_CACHE.get(mem_key)
     if cached is not None:
         if "source" not in cached.attrs:
             cached.attrs["source"] = "cache"
         return cached
+
+    parent = _RANGE_CACHE.get((symbol.upper(), timeframe))
+    if parent is not None:
+        sliced = _slice_df(parent, start, end)
+        if len(sliced) >= 2:
+            _remember(mem_key, sliced)
+            return sliced
 
     cache = _cache_path(symbol, timeframe, start, end)
     if cache.exists():
@@ -137,6 +174,9 @@ def load_ohlc(symbol: str, timeframe: str, start: datetime, end: datetime,
 
 def peek_source(symbol: str, timeframe: str, start: datetime, end: datetime) -> str:
     """Return the OHLC provenance label without mutating caller state."""
+    parent = _RANGE_CACHE.get((symbol.upper(), timeframe))
+    if parent is not None and "source" in parent.attrs:
+        return str(parent.attrs["source"])
     df = load_ohlc(symbol, timeframe, start, end)
     return str(df.attrs.get("source", "unknown"))
 

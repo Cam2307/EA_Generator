@@ -4,6 +4,7 @@ from typing import Dict, Optional
 
 import pytest
 
+from config import settings
 from factory.backtest.base import BacktestEngine
 from factory.backtest.validation import compute_wfe, validate_strategy
 from factory.models import (
@@ -90,9 +91,9 @@ def test_validate_passes_consistent_strategy():
     total = END.timestamp() - START.timestamp()
     assert report.is_range[1] - report.is_range[0] == pytest.approx(0.7 * total)
     assert report.oos_range[1] - report.oos_range[0] == pytest.approx(0.3 * total)
-    # both WFO modes ran
+    # both configured WFO modes ran
     modes = {w.mode for w in report.wfo_windows}
-    assert modes == {"anchored", "rolling"}
+    assert modes == set(settings.WFO_MODES)
 
 
 def test_validate_fails_on_oos_drawdown():

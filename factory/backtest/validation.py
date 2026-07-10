@@ -243,8 +243,8 @@ def _to_dt(ts: float) -> datetime:
 
 
 def _month_secs(months: int) -> float:
-    """Average calendar month length in seconds."""
-    return months * 30.4375 * 86400.0
+    """Average calendar month length in seconds (matches DAYS_PER_MONTH)."""
+    return months * settings.DAYS_PER_MONTH * 86400.0
 
 
 def walk_forward(engine: BacktestEngine, strategy: StrategyDefinition,
@@ -366,7 +366,8 @@ def validate_strategy(engine: BacktestEngine, strategy: StrategyDefinition,
     _raise_if_cancelled(cancel_check)
     best_params, is_metrics, stability_ratio = optimize_is(
         engine, strategy, start, _to_dt(split_ts), deposit,
-        settings.OPT_SAMPLES, rng, stability=True, cancel_check=cancel_check,
+        settings.OPT_SAMPLES, rng,
+        stability=settings.NEIGHBORHOOD_STABILITY, cancel_check=cancel_check,
     )
     oos_metrics = engine.run(strategy, _to_dt(split_ts), end,
                              params_override=best_params, deposit=deposit)
@@ -376,7 +377,7 @@ def validate_strategy(engine: BacktestEngine, strategy: StrategyDefinition,
     wfo_train = wfo_train_months if wfo_train_months is not None else settings.WFO_TRAIN_MONTHS
     wfo_test = wfo_test_months if wfo_test_months is not None else settings.WFO_TEST_MONTHS
     wfo_kwargs = dict(train_months=wfo_train, test_months=wfo_test)
-    for mode in ("anchored", "rolling"):
+    for mode in settings.WFO_MODES:
         windows += walk_forward(engine, strategy, start, end, deposit,
                                 wfo_n, mode, rng, cancel_check=cancel_check,
                                 **wfo_kwargs)

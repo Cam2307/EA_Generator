@@ -1,25 +1,43 @@
-"""Discovery control panel with live progress via st.fragment polling SQLite."""
+"""Unified discovery terminal — agent + single-run in one panel."""
 from __future__ import annotations
+
+# Bump when discovery UI changes — visible in the panel header for debugging.
+DISCOVERY_UI_VERSION = "2026-07-10-duration"
 
 import time
 import uuid
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime
 
 import streamlit as st
 
+from app.components.discovery_styles import inject_discovery_styles
+from app.components.pie_progress import render_pie_progress
+from app.components.run_view import job_summary
 from config import settings
+from factory import alerts as alerts_mod
 from factory import data as data_mod
 from factory import validation_levels
-from factory.backtest.simulator import SymbolSpec
+from factory.discovery_config import (
+    DiscoverySettings,
+    build_discovery_payload,
+    derive_wfo_from_duration,
+    history_start_end,
+    settings_from_app,
+    settings_to_app,
+)
 from factory.metrics_display import data_source_badge, data_source_label
 from factory.models import ExecutionMechanicType, JobStatus
 from factory.storage import Storage
-from jobs.orchestrator import start_orchestrator_process, stop_orchestrator_process
+from jobs.orchestrator import (
+    recover_stuck_starting_agent,
+    start_orchestrator_process,
+    stop_orchestrator_process,
+    sync_agent_with_orchestrator_lock,
+)
+from jobs.sweep import plan_sweeps
 from jobs.worker import JobQueue
-from factory import alerts as alerts_mod
 
 send_email = alerts_mod.send_email
-# Backward-compat fallback for stale/older alert modules during hot reloads.
 smtp_diagnostics = getattr(
     alerts_mod, "smtp_diagnostics", lambda: type("Diag", (), {"configured": False})()
 )
@@ -30,8 +48,8 @@ smtp_missing_message = getattr(
 )
 
 _ACTIVE = (JobStatus.PENDING, JobStatus.RUNNING)
+_RUN_MODES = ("Continuous agent", "Single run")
 
-# Friendly labels for the execution-mechanic picker (enum -> UI text).
 _MECHANIC_LABELS = {
     ExecutionMechanicType.STANDARD_SLTP: "Standard SL/TP",
     ExecutionMechanicType.DCA_GRID: "DCA / Grid",
@@ -39,7 +57,6 @@ _MECHANIC_LABELS = {
     ExecutionMechanicType.PARTIAL_CLOSE: "Partial close",
 }
 
-# Friendly labels for the trade-management overlay picker (feature key -> text).
 _TM_FEATURE_LABELS = {
     "adaptive_sl": "Adaptive (ATR) stop loss",
     "risk_reward_tp": "Risk-reward take profit",
@@ -51,322 +68,8 @@ _TM_FEATURE_LABELS = {
     "cooldown": "Cooldown after a loss",
 }
 
-
-def render_discovery_panel(queue: JobQueue, storage: Storage) -> None:
-    _render_discovery_agent_panel(storage)
-    # Live progress, KPIs and run history sit at the very top — this is the
-    # screen users watch the longest while a run is in flight, so it gets the
-    # most visual priority.
-    _live_dashboard(queue, storage)
-    _render_run_history(storage)
-
-    st.divider()
-    st.subheader(":material/rocket_launch: Start a new run")
-    st.caption(
-        "Set how many winning strategies you want, how hard they must be to "
-        "earn a pass, and how many candidates the factory may test. It "
-        "generates and screens thousands of strategy + parameter combinations, "
-        "validates the promising ones, and keeps the survivors.")
-
-    # --- Validation level (outside the form so the description updates live) --
-    st.markdown("#### Validation level")
-    level_num = st.select_slider(
-        "How strict should a 'pass' be?",
-        options=[lv.level for lv in validation_levels.VALIDATION_LEVELS],
-        value=validation_levels.DEFAULT_LEVEL,
-        format_func=lambda n: f"{n} · {validation_levels.get_level(n).name}",
-        key="val_level",
-        help="Higher levels apply every gate of the lower levels, only "
-             "stricter, and add heavier Monte Carlo robustness testing.")
-    level = validation_levels.get_level(level_num)
-    mc_note = "Monte Carlo ON" if level.montecarlo else "Monte Carlo off"
-    st.info(f"**Level {level.level} — {level.name}**  ·  {mc_note}\n\n{level.summary}")
-    with st.expander("Exactly what this level checks"):
-        for bullet in level.human_gates():
-            st.markdown(f"- {bullet}")
-
-    # Data-source probe (uses same loader as the backtest engine)
-    _render_data_source_notice()
-
-    with st.form("discovery_form"):
-        e1, e2, e3 = st.columns(3)
-        with e1:
-            symbol_options = list(settings.SYMBOLS)
-            default_symbol = settings.DEFAULT_SYMBOL
-            if default_symbol not in symbol_options:
-                symbol_options.insert(0, default_symbol)
-            symbol = st.selectbox(
-                "Symbol", symbol_options,
-                index=symbol_options.index(default_symbol),
-                key="disc_symbol",
-                help="Instrument to search on. The simulator uses cached or "
-                     "synthetic history; MT5 uses your terminal's symbols.")
-            timeframe = st.selectbox(
-                "Timeframe", ["M1", "M5", "M15", "M30", "H1", "H4", "D1"],
-                index=2, key="disc_tf")
-        with e2:
-            target_survivors = st.number_input(
-                "Winning strategies to find", 1, 100, 5,
-                help="Discovery stops as soon as it has found this many "
-                     "strategies that pass the chosen validation level.")
-            max_candidates = st.number_input(
-                "Max candidates to test", 10, 100_000, 2000, step=100,
-                help="Upper bound on how many strategy/parameter combinations "
-                     "to screen before giving up.")
-        with e3:
-            months = st.slider(
-                "History window (months)", 1, 36, 12, key="disc_months",
-                help="How much history to backtest over. Shorter = faster "
-                     "screening; longer = more robust.")
-            engine = st.selectbox(
-                "Backtest engine", ["simulator", "mt5"],
-                help="The simulator is a fast pre-filter. MT5 runs the real "
-                     "Strategy Tester headlessly (requires an installed "
-                     "terminal) and executes strictly sequentially.")
-
-        mechanics = st.multiselect(
-            "Allowed strategy types",
-            options=list(_MECHANIC_LABELS.keys()),
-            default=list(_MECHANIC_LABELS.keys()),
-            format_func=lambda m: _MECHANIC_LABELS[m],
-            help="Which trade-management styles the factory may generate and "
-                 "evolve. Pick any combination — e.g. only DCA/Grid + Hedging, "
-                 "or leave all selected to search across every type.")
-
-        tm_features = st.multiselect(
-            "Trade-management options to explore",
-            options=list(_TM_FEATURE_LABELS.keys()),
-            default=list(_TM_FEATURE_LABELS.keys()),
-            format_func=lambda f: _TM_FEATURE_LABELS[f],
-            help="Advanced exit/risk overlays the optimizer may switch on and "
-                 "tune per strategy: adaptive & trailing stops, breakeven, "
-                 "risk-based sizing and session/loss safeguards. Clear all for "
-                 "plain fixed SL/TP only. Trailing/adaptive-SL/risk sizing apply "
-                 "to directional (Standard & Partial-close) strategies; the "
-                 "filters apply to every type.")
-
-        with st.expander("Account & execution economics"):
-            st.caption(
-                "The account balance and market frictions the backtests trade "
-                "with. Defaults match the current engine settings, so leaving "
-                "them untouched keeps behaviour unchanged. Starting balance and "
-                "leverage apply to every engine; spread, slippage and contract "
-                "size shape the simulator (in MT5 these come from the broker).")
-            _spec = SymbolSpec()
-            ec1, ec2, ec3 = st.columns(3)
-            with ec1:
-                deposit = st.number_input(
-                    "Starting balance", 100.0, 100_000_000.0,
-                    value=float(settings.DEFAULT_DEPOSIT), step=1000.0,
-                    format="%.2f",
-                    help="Initial account deposit for every backtest, in the "
-                         "account currency.")
-                leverage = st.number_input(
-                    "Leverage (1:N)", 1, 1000,
-                    value=int(settings.DEFAULT_LEVERAGE), step=1,
-                    help="Account leverage. Higher leverage allows the same "
-                         "balance to hold larger positions before a margin "
-                         "refusal.")
-            with ec2:
-                spread_points = st.number_input(
-                    "Spread (points)", 0.0, 500.0,
-                    value=float(_spec.spread_points), step=1.0,
-                    help="Spread charged on every entry fill (simulator).")
-                slippage_points = st.number_input(
-                    "Slippage (points)", 0.0, 200.0,
-                    value=float(_spec.slippage_points), step=1.0,
-                    help="Adverse slippage added to every fill (simulator).")
-            with ec3:
-                contract_size = st.number_input(
-                    "Contract size", 1.0, 10_000_000.0,
-                    value=float(_spec.contract_size), step=1000.0,
-                    format="%.2f",
-                    help="Units per 1.0 lot (e.g. 100000 for standard FX). "
-                         "Drives point value and margin (simulator).")
-
-        with st.expander("Advanced (search behaviour + expert gate override)"):
-            b1, b2 = st.columns(2)
-            with b1:
-                batch_size = st.number_input(
-                    "Generation size", 10, 5000, 100, step=10,
-                    help="How many candidates are generated per evolution "
-                         "round before the best are bred into the next round.")
-            with b2:
-                genetic = st.checkbox(
-                    "Evolve toward winners", value=True,
-                    help="Breed the best-screened candidates into each new "
-                         "generation instead of pure random search.")
-            st.markdown("**Advanced strategy generation**")
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                advanced_mode = st.checkbox(
-                    "Enable advanced mode", value=False,
-                    help="Generate richer multi-signal candidates with anti-bloat caps.")
-            with c2:
-                complexity_cap = st.slider(
-                    "Complexity cap", 2, 10, 5,
-                    help="Maximum complexity budget for entry logic; higher explores more expressive rules.")
-            with c3:
-                enable_regime_switching = st.checkbox(
-                    "Enable regime switching", value=True,
-                    help="Bias generation toward volatility/trend state-aware compositions.")
-            enable_mtf_context = st.checkbox(
-                "Enable multi-timeframe context", value=True,
-                help="Inject higher-timeframe context filters when compatible.")
-            feature_toggles = st.multiselect(
-                "Feature families",
-                options=["momentum", "mean_reversion", "volatility", "market_structure"],
-                default=["momentum", "mean_reversion", "volatility", "market_structure"],
-                help="Constrain advanced primitives to selected families.")
-
-            use_custom = st.checkbox(
-                "Override the level with custom gates (expert)", value=False,
-                help="Ignore the validation level above and use the exact "
-                     "numeric gates below instead.")
-            st.caption("These only apply when the override box is ticked.")
-            ac1, ac2, ac3, ac4 = st.columns(4)
-            with ac1:
-                wfe_min = st.number_input("Min WFE", 0.0, 2.0,
-                                          value=float(settings.WFE_THRESHOLD), step=0.05)
-                max_dd = st.number_input("Max OOS DD %", 1.0, 50.0,
-                                         value=float(settings.OOS_MAX_DD_PCT), step=1.0)
-            with ac2:
-                min_trades = st.number_input("Min OOS trades", 1, 200,
-                                             value=int(settings.MIN_OOS_TRADES))
-                min_pf = st.number_input("Min profit factor (0=off)", 0.0, 5.0,
-                                         value=float(settings.MIN_PROFIT_FACTOR), step=0.1)
-            with ac3:
-                min_sharpe = st.number_input("Min Sharpe (0=off)", 0.0, 5.0,
-                                             value=float(settings.MIN_SHARPE), step=0.1)
-                min_r2 = st.number_input("Min R-squared (0=off)", 0.0, 1.0,
-                                         value=float(settings.MIN_R_SQUARED), step=0.05)
-            with ac4:
-                max_consec = st.number_input("Max consec. losses (0=off)", 0, 50,
-                                             value=int(settings.MAX_CONSECUTIVE_LOSSES))
-                custom_mc = st.checkbox("Monte Carlo gate", value=settings.MC_ENABLED)
-                custom_mc_runs = st.number_input("MC runs", 5, 200,
-                                                 int(settings.MC_RUNS))
-
-            st.markdown("**Walk-forward windows**")
-            wfo1, wfo2, wfo3 = st.columns(3)
-            with wfo1:
-                wfo_train_months = st.number_input(
-                    "WFO train (months)", 1, 24, int(settings.WFO_TRAIN_MONTHS),
-                    help="In-sample length for each rolling walk-forward window.")
-            with wfo2:
-                wfo_test_months = st.number_input(
-                    "WFO test (months)", 1, 12, int(settings.WFO_TEST_MONTHS),
-                    help="Out-of-sample length tested after each train window.")
-            with wfo3:
-                wfo_window_count = st.number_input(
-                    "WFO windows per mode", 1, 12, int(settings.WFO_WINDOWS),
-                    help="Number of anchored and rolling windows to compute.")
-
-        submitted = st.form_submit_button("Start discovery", type="primary")
-
-    active_jobs = [j for j in storage.list_jobs("discovery") if j.status in _ACTIVE]
-
-    if submitted:
-        if active_jobs:
-            st.warning("A discovery run is already going — cancel it first "
-                       "or wait for it to finish.")
-        elif not mechanics:
-            st.warning("Pick at least one strategy type to search.")
-        else:
-            end = date.today()
-            start = end - timedelta(days=int(months) * 30)
-            job_id = f"disc_{uuid.uuid4().hex[:10]}"
-            payload = {
-                "symbol": symbol.strip().upper(),
-                "timeframe": timeframe,
-                "start": datetime.combine(start, datetime.min.time(),
-                                          tzinfo=timezone.utc).isoformat(),
-                "end": datetime.combine(end, datetime.min.time(),
-                                        tzinfo=timezone.utc).isoformat(),
-                "engine": engine,
-                "deposit": float(deposit),
-                "leverage": int(leverage),
-                "spread_points": float(spread_points),
-                "slippage_points": float(slippage_points),
-                "contract_size": float(contract_size),
-                "batch_size": int(batch_size),
-                "target_survivors": int(target_survivors),
-                "max_candidates": int(max_candidates),
-                "genetic": bool(genetic),
-                "mechanics": [m.value for m in mechanics],
-                "tm_features": list(tm_features),
-                "wfo_train_months": int(wfo_train_months),
-                "wfo_test_months": int(wfo_test_months),
-                "wfo_windows": int(wfo_window_count),
-                "advanced_mode": bool(advanced_mode),
-                "complexity_cap": int(complexity_cap),
-                "enable_regime_switching": bool(enable_regime_switching),
-                "enable_mtf_context": bool(enable_mtf_context),
-                "feature_toggles": list(feature_toggles),
-            }
-            try:
-                payload["data_source"] = data_mod.peek_source(
-                    payload["symbol"], payload["timeframe"],
-                    datetime.fromisoformat(payload["start"]),
-                    datetime.fromisoformat(payload["end"]),
-                )
-            except Exception:
-                payload["data_source"] = "unknown"
-            if use_custom:
-                payload["montecarlo"] = custom_mc
-                payload["mc_runs"] = int(custom_mc_runs)
-                payload["criteria"] = {
-                    "min_wfe": wfe_min,
-                    "max_dd_pct": max_dd,
-                    "min_trades": int(min_trades),
-                    "min_profit_factor": min_pf,
-                    "min_sharpe": min_sharpe,
-                    "min_r_squared": min_r2,
-                    "max_consecutive_losses": int(max_consec),
-                }
-                pass_desc = "custom expert gates"
-            else:
-                payload["validation_level"] = int(level_num)
-                pass_desc = f"Level {level.level} ({level.name})"
-
-            if queue.submit_discovery(job_id, payload):
-                st.success(f"Discovery started — searching for "
-                           f"{int(target_survivors)} strategies passing "
-                           f"{pass_desc}.")
-            else:
-                st.info("This run is already queued (duplicate submit ignored).")
-            st.rerun()
-
-
-def _render_data_source_notice() -> None:
-    """Show a prominent warning when backtests would use synthetic OHLC."""
-    sym = st.session_state.get("disc_symbol", settings.DEFAULT_SYMBOL)
-    tf = st.session_state.get("disc_tf", settings.DEFAULT_TIMEFRAME)
-    months = st.session_state.get("disc_months", 12)
-    end = date.today()
-    start = end - timedelta(days=int(months) * 30)
-    try:
-        src = data_mod.peek_source(
-            sym.strip().upper(), tf,
-            datetime.combine(start, datetime.min.time(), tzinfo=timezone.utc),
-            datetime.combine(end, datetime.min.time(), tzinfo=timezone.utc),
-        )
-    except Exception:
-        src = "unknown"
-    badge = data_source_badge(src)
-    if src == "synthetic":
-        st.warning(
-            f"**Synthetic market data** {badge} — results are for development "
-            "only. Install MetaTrader 5 and connect to a broker for real "
-            "OHLC, or use a parquet cache in `data/`.")
-    elif src == "cache":
-        st.caption(f"Backtest data: {badge} ({data_source_label(src)})")
-    else:
-        st.caption(f"Backtest data: {badge}")
-
-
 _STATUS_STYLE = {
-    JobStatus.RUNNING: (":blue-badge[:material/bolt: Running]", "blue"),
+    JobStatus.RUNNING: (":orange-badge[:material/bolt: Running]", "orange"),
     JobStatus.PENDING: (":gray-badge[:material/schedule: Queued]", "gray"),
     JobStatus.DONE: (":green-badge[:material/check_circle: Done]", "green"),
     JobStatus.CANCELLED: (":orange-badge[:material/stop_circle: Cancelled]", "orange"),
@@ -374,38 +77,595 @@ _STATUS_STYLE = {
 }
 
 
-def _job_summary(job) -> str:
-    lvl = job.payload.get("validation_level")
-    gate = f"Level {lvl}" if lvl is not None else "custom gates"
-    return (f"{job.payload.get('symbol', '?')} · "
-            f"{job.payload.get('timeframe', '?')} · "
-            f"{job.payload.get('engine', '?')} · {gate} · "
-            f"data {job.payload.get('data_source', '?')} · "
-            f"target {job.payload.get('target_survivors', '?')}")
+def render_discovery_panel(queue: JobQueue, storage: Storage) -> None:
+    inject_discovery_styles()
+    saved = settings_from_app(storage.get_app_settings())
+    agent_state = storage.get_agent_state()
+    agent_running = bool(int(agent_state.get("enabled", 0) or 0))
+
+    if agent_running and "discovery_run_mode" not in st.session_state:
+        st.session_state.discovery_run_mode = "Continuous agent"
+
+    st.markdown(
+        f"""
+        <div class="ea-terminal-shell">
+          <div class="ea-terminal-head">
+            <div>
+              <p class="ea-terminal-title">Discovery terminal</p>
+              <p class="ea-terminal-sub">
+                Configure markets, validation, and search — then launch a
+                continuous agent or a one-shot sweep. Live status and controls
+                share one workspace.
+              </p>
+            </div>
+            <span class="ea-terminal-chip">EA factory · UI {DISCOVERY_UI_VERSION}</span>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    _live_status(queue, storage)
+
+    _mech_default = [
+        m for m in _MECHANIC_LABELS if m.value in saved.mechanics
+    ] or list(_MECHANIC_LABELS.keys())
+    _tm_default = [f for f in _TM_FEATURE_LABELS if f in saved.tm_features]
+    if not _tm_default:
+        _tm_default = list(_TM_FEATURE_LABELS.keys())
+    _tf_options = ["M1", "M5", "M15", "M30", "H1", "H4", "D1"]
+
+    with st.container(border=True):
+        mode = st.segmented_control(
+            "Run mode",
+            options=_RUN_MODES,
+            key="discovery_run_mode",
+            help=(
+                "Continuous agent cycles symbol×timeframe sweeps until you stop. "
+                "Single run executes once — one job for a single pair, or a "
+                "batch pass for every selected combination."
+            ),
+        )
+        is_agent = mode == "Continuous agent"
+
+        with st.form("discovery_form"):
+            st.markdown(
+                '<p class="ea-section-label">Market scope</p>',
+                unsafe_allow_html=True,
+            )
+            s1, s2 = st.columns(2)
+            with s1:
+                symbols = st.multiselect(
+                    "Symbols",
+                    options=list(settings.SYMBOLS),
+                    default=list(saved.symbols),
+                    help="Every selected symbol is included in each sweep.",
+                )
+            with s2:
+                timeframes = st.multiselect(
+                    "Timeframes",
+                    options=_tf_options,
+                    default=[tf for tf in saved.timeframes if tf in _tf_options]
+                    or ["M15", "H1"],
+                    help="Every selected timeframe is included in each sweep.",
+                )
+
+            st.markdown(
+                '<p class="ea-section-label">Validation</p>',
+                unsafe_allow_html=True,
+            )
+            level_num = st.select_slider(
+                "How strict should a pass be?",
+                options=[lv.level for lv in validation_levels.VALIDATION_LEVELS],
+                value=int(saved.validation_level),
+                format_func=lambda n: f"{n} · {validation_levels.get_level(n).name}",
+                help="Higher levels apply every gate of the lower levels, only "
+                     "stricter, and add heavier Monte Carlo robustness testing.",
+            )
+            level = validation_levels.get_level(level_num)
+            mc_note = "Monte Carlo on" if level.montecarlo else "Monte Carlo off"
+            st.markdown(
+                f"""
+                <div class="ea-val-card">
+                  <strong>Level {level.level} — {level.name}</strong>
+                  &nbsp;·&nbsp; {mc_note}
+                  <p>{level.summary}</p>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            with st.expander("Exactly what this level checks", icon=":material/rule:"):
+                for bullet in level.human_gates():
+                    st.markdown(f"- {bullet}")
+
+            st.markdown(
+                '<p class="ea-section-label">Run budget</p>',
+                unsafe_allow_html=True,
+            )
+            e1, e2, e3 = st.columns(3)
+            with e1:
+                target_survivors = st.number_input(
+                    "Winning strategies to find", 1, 100, int(saved.target_survivors),
+                    help="Discovery stops as soon as it has found this many "
+                         "strategies that pass the chosen validation level.",
+                )
+                max_candidates = st.number_input(
+                    "Max candidates to test", 10, 100_000, int(saved.max_candidates),
+                    step=100,
+                    help="Upper bound on how many strategy/parameter combinations "
+                         "to screen before giving up.",
+                )
+            with e2:
+                months = st.slider(
+                    "Test duration (months)", 1, 36, int(saved.months),
+                    help="How much recent history each backtest covers. "
+                         "Walk-forward folds are sized automatically from this.",
+                )
+                _wfo_train, _wfo_test, _wfo_n = derive_wfo_from_duration(int(months))
+                st.caption(
+                    f"Walk-forward auto: {_wfo_train}m train / {_wfo_test}m test "
+                    f"× {_wfo_n} window{'s' if _wfo_n != 1 else ''}"
+                )
+                _engine_options = ["simulator", "mt5"]
+                _engine_default = (
+                    saved.engine if saved.engine in _engine_options else "simulator"
+                )
+                engine = st.selectbox(
+                    "Backtest engine", _engine_options,
+                    index=_engine_options.index(_engine_default),
+                    help="The simulator is a fast pre-filter. MT5 runs the real "
+                         "Strategy Tester headlessly (requires an installed "
+                         "terminal) and executes strictly sequentially.",
+                )
+            with e3:
+                batch_size = st.number_input(
+                    "Generation size", 10, 5000, int(saved.batch_size), step=10,
+                    help="How many candidates are generated per evolution round.",
+                )
+                genetic = st.checkbox(
+                    "Evolve toward winners", value=bool(saved.genetic),
+                    help="Breed the best-screened candidates into each new "
+                         "generation instead of pure random search.",
+                )
+
+            _render_data_source_notice(symbols, timeframes, months)
+
+            st.markdown(
+                '<p class="ea-section-label">Strategy universe</p>',
+                unsafe_allow_html=True,
+            )
+            mechanics = st.multiselect(
+                "Allowed strategy types",
+                options=list(_MECHANIC_LABELS.keys()),
+                default=_mech_default,
+                format_func=lambda m: _MECHANIC_LABELS[m],
+                help="Which trade-management styles the factory may generate and evolve.",
+            )
+            tm_features = st.multiselect(
+                "Trade-management options to explore",
+                options=list(_TM_FEATURE_LABELS.keys()),
+                default=_tm_default,
+                format_func=lambda f: _TM_FEATURE_LABELS[f],
+                help="Advanced exit/risk overlays the optimizer may switch on and tune.",
+            )
+
+            if is_agent:
+                st.markdown(
+                    '<p class="ea-section-label">Notifications</p>',
+                    unsafe_allow_html=True,
+                )
+                n1, n2, n3 = st.columns(3)
+                with n1:
+                    recipient = st.text_input(
+                        "Alert recipient email",
+                        value=str(saved.recipient_email),
+                    )
+                with n2:
+                    min_score = st.number_input(
+                        "Minimum quality score to alert",
+                        min_value=0.0, max_value=100.0,
+                        value=float(saved.alert_min_score), step=1.0,
+                    )
+                with n3:
+                    progress_hours = st.number_input(
+                        "Progress email interval (hours)",
+                        min_value=0.25, max_value=24.0,
+                        value=float(saved.progress_email_hours), step=0.25,
+                    )
+            else:
+                recipient = str(saved.recipient_email)
+                min_score = float(saved.alert_min_score)
+                progress_hours = float(saved.progress_email_hours)
+
+            with st.expander("Account & execution economics", icon=":material/account_balance:"):
+                st.caption(
+                    "The account balance and market frictions the backtests trade with.")
+                ec1, ec2, ec3 = st.columns(3)
+                with ec1:
+                    deposit = st.number_input(
+                        "Starting balance", 100.0, 100_000_000.0,
+                        value=float(saved.deposit), step=1000.0, format="%.2f")
+                    leverage = st.number_input(
+                        "Leverage (1:N)", 1, 1000,
+                        value=int(saved.leverage), step=1)
+                with ec2:
+                    spread_points = st.number_input(
+                        "Spread (points)", 0.0, 500.0,
+                        value=float(saved.spread_points), step=1.0)
+                    slippage_points = st.number_input(
+                        "Slippage (points)", 0.0, 200.0,
+                        value=float(saved.slippage_points), step=1.0)
+                with ec3:
+                    contract_size = st.number_input(
+                        "Contract size", 1.0, 10_000_000.0,
+                        value=float(saved.contract_size), step=1000.0, format="%.2f")
+
+            with st.expander(
+                "Advanced (search behaviour + expert gate override)",
+                icon=":material/tune:",
+            ):
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    advanced_mode = st.checkbox(
+                        "Enable advanced mode", value=bool(saved.advanced_mode))
+                with c2:
+                    complexity_cap = st.slider(
+                        "Complexity cap", 2, 10, int(saved.complexity_cap))
+                with c3:
+                    enable_regime_switching = st.checkbox(
+                        "Enable regime switching",
+                        value=bool(saved.enable_regime_switching))
+                enable_mtf_context = st.checkbox(
+                    "Enable multi-timeframe context",
+                    value=bool(saved.enable_mtf_context))
+                feature_toggles = st.multiselect(
+                    "Feature families",
+                    options=["momentum", "mean_reversion", "volatility", "market_structure"],
+                    default=list(saved.feature_toggles),
+                )
+
+                use_custom = st.checkbox(
+                    "Override the level with custom gates (expert)",
+                    value=bool(saved.use_custom))
+                _crit = saved.custom_criteria or {}
+                ac1, ac2, ac3, ac4 = st.columns(4)
+                with ac1:
+                    wfe_min = st.number_input(
+                        "Min WFE", 0.0, 2.0,
+                        value=float(_crit.get("min_wfe", settings.WFE_THRESHOLD)),
+                        step=0.05)
+                    max_dd = st.number_input(
+                        "Max OOS DD %", 1.0, 50.0,
+                        value=float(_crit.get("max_dd_pct", settings.OOS_MAX_DD_PCT)),
+                        step=1.0)
+                with ac2:
+                    min_trades = st.number_input(
+                        "Min OOS trades", 1, 200,
+                        value=int(_crit.get("min_trades", settings.MIN_OOS_TRADES)))
+                    min_pf = st.number_input(
+                        "Min profit factor (0=off)", 0.0, 5.0,
+                        value=float(_crit.get("min_profit_factor", settings.MIN_PROFIT_FACTOR)),
+                        step=0.1)
+                with ac3:
+                    min_sharpe = st.number_input(
+                        "Min Sharpe (0=off)", 0.0, 5.0,
+                        value=float(_crit.get("min_sharpe", settings.MIN_SHARPE)),
+                        step=0.1)
+                    min_r2 = st.number_input(
+                        "Min R-squared (0=off)", 0.0, 1.0,
+                        value=float(_crit.get("min_r_squared", settings.MIN_R_SQUARED)),
+                        step=0.05)
+                with ac4:
+                    max_consec = st.number_input(
+                        "Max consec. losses (0=off)", 0, 50,
+                        value=int(_crit.get(
+                            "max_consecutive_losses", settings.MAX_CONSECUTIVE_LOSSES
+                        )))
+                    custom_mc = st.checkbox(
+                        "Monte Carlo gate", value=bool(saved.custom_montecarlo))
+                    custom_mc_runs = st.number_input(
+                        "MC runs", 5, 200, int(saved.custom_mc_runs))
+
+                st.caption(
+                    "Walk-forward fold sizes follow **Test duration** above "
+                    f"(currently {_wfo_train}m / {_wfo_test}m × {_wfo_n})."
+                )
+
+            if is_agent:
+                submit_label = ":material/smart_toy: Start continuous agent"
+            else:
+                submit_label = ":material/play_arrow: Run once"
+            submitted = st.form_submit_button(
+                submit_label,
+                type="primary",
+                width="stretch",
+            )
+
+        active_jobs = [j for j in storage.list_jobs("discovery") if j.status in _ACTIVE]
+
+        if submitted:
+            # Fresh seed each submit so re-runs explore different strategies
+            # instead of replaying the same genetic trajectory.
+            run_seed = (int(time.time()) ^ (saved.base_seed * 2654435761)) & 0x7FFFFFFF
+            _wfo_train, _wfo_test, _wfo_n = derive_wfo_from_duration(int(months))
+            discovery_cfg = _form_to_settings(
+                level_num=int(level_num),
+                symbols=symbols,
+                timeframes=timeframes,
+                months=int(months),
+                engine=engine,
+                deposit=float(deposit),
+                leverage=int(leverage),
+                spread_points=float(spread_points),
+                slippage_points=float(slippage_points),
+                contract_size=float(contract_size),
+                batch_size=int(batch_size),
+                target_survivors=int(target_survivors),
+                max_candidates=int(max_candidates),
+                genetic=bool(genetic),
+                mechanics=mechanics,
+                tm_features=tm_features,
+                wfo_train_months=int(_wfo_train),
+                wfo_test_months=int(_wfo_test),
+                wfo_windows=int(_wfo_n),
+                advanced_mode=bool(advanced_mode),
+                complexity_cap=int(complexity_cap),
+                enable_regime_switching=bool(enable_regime_switching),
+                enable_mtf_context=bool(enable_mtf_context),
+                feature_toggles=feature_toggles,
+                use_custom=bool(use_custom),
+                wfe_min=wfe_min,
+                max_dd=max_dd,
+                min_trades=min_trades,
+                min_pf=min_pf,
+                min_sharpe=min_sharpe,
+                min_r2=min_r2,
+                max_consec=max_consec,
+                custom_mc=custom_mc,
+                custom_mc_runs=int(custom_mc_runs),
+                recipient=recipient,
+                min_score=float(min_score),
+                progress_hours=float(progress_hours),
+                base_seed=run_seed,
+            )
+            storage.upsert_app_settings(settings_to_app(discovery_cfg))
+
+            if not symbols:
+                st.warning("Pick at least one symbol.")
+            elif not timeframes:
+                st.warning("Pick at least one timeframe.")
+            elif not mechanics:
+                st.warning("Pick at least one strategy type to search.")
+            elif active_jobs:
+                st.warning("A discovery run is already going — stop it first "
+                           "or wait for it to finish.")
+            elif is_agent:
+                sweep_count = len(plan_sweeps(
+                    symbols=list(symbols),
+                    timeframes=list(timeframes),
+                    months=discovery_cfg.months,
+                    base_seed=discovery_cfg.base_seed,
+                ))
+                if _start_orchestrator(storage, mode="continuous"):
+                    st.success(
+                        f"Agent started — cycling {sweep_count} sweeps "
+                        f"({len(symbols)} symbols × {len(timeframes)} timeframes)."
+                    )
+                else:
+                    st.error(storage.get_agent_state().get("message")
+                             or "Could not start the discovery agent.")
+                st.rerun()
+            else:
+                _submit_single_run(queue, storage, discovery_cfg)
+
+        if is_agent:
+            _render_email_tools(storage)
+
+    _render_run_history(storage)
+
+
+def _submit_single_run(
+    queue: JobQueue,
+    storage: Storage,
+    cfg: DiscoverySettings,
+) -> None:
+    plans = plan_sweeps(
+        symbols=list(cfg.symbols),
+        timeframes=list(cfg.timeframes),
+        months=cfg.months,
+        base_seed=cfg.base_seed,
+    )
+    if len(plans) == 1:
+        plan = plans[0]
+        payload = build_discovery_payload(
+            cfg,
+            symbol=plan.symbol,
+            timeframe=plan.timeframe,
+            seed=plan.seed,
+        )
+        job_id = f"disc_{uuid.uuid4().hex[:10]}"
+        if queue.submit_discovery(job_id, payload):
+            st.success(
+                f"Single run queued — {plan.symbol} · {plan.timeframe} · `{job_id}`"
+            )
+        else:
+            st.info("This run is already queued (duplicate submit ignored).")
+    else:
+        if _start_orchestrator(storage, mode="batch"):
+            st.success(
+                f"Batch run started — {len(plans)} sweeps "
+                f"({len(cfg.symbols)} symbols × {len(cfg.timeframes)} timeframes)."
+            )
+        else:
+            st.error(storage.get_agent_state().get("message")
+                     or "Could not start the batch agent.")
+    st.rerun()
+
+
+def _form_to_settings(
+    *,
+    level_num: int,
+    symbols: list[str],
+    timeframes: list[str],
+    months: int,
+    engine: str,
+    deposit: float,
+    leverage: int,
+    spread_points: float,
+    slippage_points: float,
+    contract_size: float,
+    batch_size: int,
+    target_survivors: int,
+    max_candidates: int,
+    genetic: bool,
+    mechanics: list[ExecutionMechanicType],
+    tm_features: list[str],
+    wfo_train_months: int,
+    wfo_test_months: int,
+    wfo_windows: int,
+    advanced_mode: bool,
+    complexity_cap: int,
+    enable_regime_switching: bool,
+    enable_mtf_context: bool,
+    feature_toggles: list[str],
+    use_custom: bool,
+    wfe_min: float,
+    max_dd: float,
+    min_trades: int,
+    min_pf: float,
+    min_sharpe: float,
+    min_r2: float,
+    max_consec: int,
+    custom_mc: bool,
+    custom_mc_runs: int,
+    recipient: str,
+    min_score: float,
+    progress_hours: float,
+    base_seed: int,
+) -> DiscoverySettings:
+    custom_criteria = {
+        "min_wfe": wfe_min,
+        "max_dd_pct": max_dd,
+        "min_trades": int(min_trades),
+        "min_profit_factor": min_pf,
+        "min_sharpe": min_sharpe,
+        "min_r_squared": min_r2,
+        "max_consecutive_losses": int(max_consec),
+    }
+    cfg = DiscoverySettings(
+        symbols=list(symbols) or list(settings.SYMBOLS[:5]),
+        timeframes=list(timeframes) or ["M15", "H1"],
+        months=int(months),
+        engine=str(engine),
+        deposit=float(deposit),
+        leverage=int(leverage),
+        spread_points=float(spread_points),
+        slippage_points=float(slippage_points),
+        contract_size=float(contract_size),
+        batch_size=int(batch_size),
+        target_survivors=int(target_survivors),
+        max_candidates=int(max_candidates),
+        genetic=bool(genetic),
+        mechanics=[m.value for m in mechanics],
+        tm_features=list(tm_features),
+        wfo_train_months=int(wfo_train_months),
+        wfo_test_months=int(wfo_test_months),
+        wfo_windows=int(wfo_windows),
+        advanced_mode=bool(advanced_mode),
+        complexity_cap=int(complexity_cap),
+        enable_regime_switching=bool(enable_regime_switching),
+        enable_mtf_context=bool(enable_mtf_context),
+        feature_toggles=list(feature_toggles),
+        validation_level=int(level_num),
+        use_custom=bool(use_custom),
+        custom_criteria=custom_criteria,
+        custom_montecarlo=bool(custom_mc),
+        custom_mc_runs=int(custom_mc_runs),
+        base_seed=int(base_seed),
+        recipient_email=str(recipient).strip(),
+        alert_min_score=float(min_score),
+        progress_email_hours=float(progress_hours),
+    )
+    cfg.sync_wfo_from_duration()
+    return cfg
+
+
+def _start_orchestrator(storage: Storage, *, mode: str) -> bool:
+    storage.update_agent_state(
+        enabled=1,
+        status="starting",
+        mode=mode,
+        cursor=0,
+        pid=None,
+        spawn_attempts=0,
+        message="Starting discovery…",
+    )
+    if sync_agent_with_orchestrator_lock(storage):
+        return True
+    if start_orchestrator_process():
+        sync_agent_with_orchestrator_lock(storage)
+        return True
+    if sync_agent_with_orchestrator_lock(storage):
+        return True
+    storage.update_agent_state(
+        enabled=0,
+        status="stopped",
+        pid=None,
+        message=(
+            "Could not start discovery agent — another instance may "
+            "already be running. Stop it or restart the dashboard."
+        ),
+    )
+    return False
+
+
+def _render_data_source_notice(
+    symbols: list[str],
+    timeframes: list[str],
+    months: int,
+) -> None:
+    sym = str(symbols[0]).strip().upper() if symbols else settings.DEFAULT_SYMBOL
+    tf = str(timeframes[0]) if timeframes else settings.DEFAULT_TIMEFRAME
+    start_dt, end_dt = history_start_end(int(months))
+    try:
+        src = data_mod.peek_source(sym.strip().upper(), tf, start_dt, end_dt)
+    except Exception:
+        src = "unknown"
+    badge = data_source_badge(src)
+    span_label = (
+        f"{start_dt.date().isoformat()} → {end_dt.date().isoformat()} "
+        f"({int(months)} mo)"
+    )
+    if src == "synthetic":
+        st.warning(
+            f"**Synthetic market data** {badge} — {span_label}. "
+            "Results are for development only. Install MetaTrader 5 and "
+            "connect to a broker for real OHLC, or use a parquet cache in "
+            "`data/`.")
+    elif src == "cache":
+        st.caption(
+            f"Backtest data: {badge} ({data_source_label(src)}) · {span_label}"
+        )
+    else:
+        st.caption(f"Backtest data: {badge} · {span_label}")
 
 
 @st.fragment(run_every="2s")
-def _live_dashboard(queue: JobQueue, storage: Storage) -> None:
-    """Top-of-page live view: KPIs plus the current-run hero.
-
-    This 2-second fragment polls SQLite so the progress stays live without
-    rerunning the (expensive) configuration form below it. Run history and the
-    results modal live *outside* this fragment on purpose — a modal opened from
-    inside a ``run_every`` fragment would be torn down on every tick.
-    """
+def _live_status(queue: JobQueue, storage: Storage) -> None:
+    sync_agent_with_orchestrator_lock(storage)
+    recover_stuck_starting_agent(storage)
     jobs = storage.list_jobs("discovery")
     active = [j for j in jobs if j.status in _ACTIVE]
+    state = storage.get_agent_state()
+    agent_enabled = bool(int(state.get("enabled", 0) or 0))
+    agent_status = str(state.get("status", "stopped"))
 
-    # When the last active run finishes, do one full-app rerun so the run
-    # history (rendered outside this fragment) picks up the newly-finished run
-    # and its results. Only the >0 -> 0 edge triggers it, so we never loop.
-    prev_active = st.session_state.get("_active_run_count")
     st.session_state["_active_run_count"] = len(active)
-    if prev_active and len(active) == 0:
-        st.rerun(scope="app")
 
-    passing = len(storage.list_validated(passed_only=True))
-    tested_total = len(storage.list_strategies())
+    passing = storage.count_validated(passed_only=True)
+    tested_total = storage.count_strategies()
+
+    st.markdown('<p class="ea-section-label">Live status</p>', unsafe_allow_html=True)
     k1, k2, k3 = st.columns(3)
     k1.metric("Winning strategies", passing, border=True,
               help="Passed the validation level — ready to export.")
@@ -413,22 +673,90 @@ def _live_dashboard(queue: JobQueue, storage: Storage) -> None:
               help="Every candidate ever screened across all runs.")
     k3.metric("Active runs", len(active), border=True)
 
+    _render_status_strip(state, agent_enabled, agent_status, active)
+
     if active:
         for job in active:
-            _render_active_hero(job, queue)
-    else:
-        st.info("No run in progress. Configure one below and press "
-                "**Start discovery** — live progress will appear here.")
+            _render_active_hero(job, queue, show_heading=False)
+    elif agent_enabled and agent_status in ("running", "starting", "stopping"):
+        _render_agent_waiting(state)
+    elif not agent_enabled and not active:
+        mode_hint = st.session_state.get("discovery_run_mode", "Single run")
+        if mode_hint == "Continuous agent":
+            st.caption("Configure options below and start the continuous agent.")
+        else:
+            st.caption("Configure options below and press **Run once**.")
 
 
-def _render_active_hero(job, queue: JobQueue) -> None:
-    """Big, prominent progress panel for a run that is in flight."""
+def _render_status_strip(
+    state: dict,
+    agent_enabled: bool,
+    agent_status: str,
+    active: list,
+) -> None:
+    hb = state.get("heartbeat_at")
+    hb_txt = "never" if not hb else datetime.fromtimestamp(hb).strftime("%H:%M:%S")
+    running = agent_enabled or bool(active)
+    cols = st.columns([1, 1, 1, 1, 1] if running else [1, 1, 1, 1],
+                       vertical_alignment="center")
+    cols[0].metric("Agent status", agent_status, border=True)
+    cols[1].metric("Heartbeat", hb_txt, border=True)
+    cols[2].metric("Queue", int(state.get("queue_depth", 0) or 0), border=True)
+    cols[3].metric("Sweeps", int(state.get("jobs_submitted", 0) or 0), border=True)
+    if running:
+        with cols[4]:
+            st.button(
+                ":material/stop: Stop",
+                key="discovery_stop_btn",
+                width="stretch",
+                on_click=_stop_agent,
+            )
+
+    message = str(state.get("message") or "").strip()
+    mode = str(state.get("mode") or "continuous")
+    if agent_enabled and agent_status in ("running", "starting"):
+        sweep_total = int(state.get("sweep_total", 0) or 0)
+        if sweep_total > 0:
+            cursor = int(state.get("cursor", 0) or 0)
+            sweep_idx = max(cursor - 1, 0) % sweep_total
+            label = (
+                f"Batch sweep — {sweep_idx + 1} / {sweep_total}"
+                if mode == "batch"
+                else f"Cycle — {sweep_idx + 1} / {sweep_total}"
+            )
+            st.progress(
+                min((sweep_idx + 1) / sweep_total, 1.0),
+                text=label,
+            )
+    if message:
+        st.caption(message)
+    elif agent_status == "stopping":
+        st.caption("Stop requested — cancelling jobs and force-stopping the agent.")
+
+
+def _render_agent_waiting(state: dict) -> None:
+    st.info(str(state.get("message") or "Agent running — waiting for the next sweep…"))
+
+
+def _stop_agent() -> None:
+    stop_orchestrator_process()
+
+
+def _render_active_hero(job, queue: JobQueue, *, show_heading: bool = True) -> None:
+    is_agent = str(job.id).startswith("auto_")
     with st.container(border=True):
         head_l, head_r = st.columns([4, 1], vertical_alignment="center")
         with head_l:
-            st.markdown(f"### :material/bolt: Current run &nbsp; "
-                        f"`{job.id}`")
-            st.caption(_job_summary(job))
+            if show_heading:
+                title = (
+                    ":material/smart_toy: Agent sweep"
+                    if is_agent else ":material/bolt: Current run"
+                )
+                st.markdown(f"### {title} &nbsp; `{job.id}`")
+            else:
+                label = "Agent sweep" if is_agent else "Current run"
+                st.markdown(f"**{label}** · `{job.id}`")
+            st.caption(job_summary(job))
         with head_r:
             if job.cancel_requested:
                 st.button("Cancelling…", key=f"cancel_{job.id}",
@@ -443,162 +771,54 @@ def _render_active_hero(job, queue: JobQueue) -> None:
                 st.code(job.error)
 
 
-def _render_run_history(storage: Storage) -> None:
-    """Run history + per-run results modal.
-
-    Deliberately *not* inside the ``run_every`` fragment: the results dialog is
-    opened with the button-return pattern, which only survives if no timer tick
-    tears it down. Finished runs don't change, so no live refresh is needed.
-    """
-    finished = [j for j in storage.list_jobs("discovery")
-                if j.status not in _ACTIVE]
-    if not finished:
-        return
-
-    with st.expander(f":material/history: Run history ({len(finished)})",
-                     expanded=True):
-        for job in finished[:12]:
-            badge = _STATUS_STYLE.get(job.status, (job.status.value,))[0]
-            passed, total = storage.count_validated(job.id)
-            with st.container(border=True):
-                left, mid, right = st.columns([3, 4, 2],
-                                              vertical_alignment="center")
-                with left:
-                    st.markdown(f"**`{job.id}`**")
-                    st.caption(_job_summary(job))
-                with mid:
-                    st.markdown(badge)
-                    if job.message:
-                        st.caption(job.message)
-                    if total:
-                        st.caption(f":green[{passed} passed] · {total} evaluated")
-                with right:
-                    if st.button(
-                            f":material/insights: Show results ({total})",
-                            key=f"results_{job.id}", width="stretch",
-                            disabled=total == 0,
-                            help=("This run's strategies."
-                                  if total else "No evaluated strategies.")):
-                        _results_dialog(storage, job)
-                    if job.error:
-                        with st.expander("Issue"):
-                            st.code(job.error)
-
-
-@st.dialog("Run results", width="large")
-def _results_dialog(storage: Storage, job) -> None:
-    """Modal showing every strategy a single run produced, as compact cards.
-
-    Renders the *same* card component as the Strategy Gallery in ``compact``
-    mode, so a run's results look consistent with the gallery. A per-run
-    ``key_prefix`` keeps widget/chart keys distinct from the gallery's cards.
-    This dialog lives outside the 2-second live fragment (opened from the run
-    history), so its charts are not torn down on each refresh.
-
-    Pagination and cached Plotly thumbnails keep the modal responsive when a
-    run evaluated many candidates.
-    """
-    from app.components.strategy_card import (
-        _MODAL_PAGE_SIZE, render_page_controls, render_report_grid,
-        render_sort_selectbox, sort_reports, _page_slice,
-    )
-
-    st.markdown(f"**`{job.id}`** · {_job_summary(job)}")
-    reports = storage.list_validated(passed_only=False, job_id=job.id)
-    if not reports:
-        st.info("This run produced no evaluated strategies.")
-        return
-
-    passed = [r for r in reports if r.passed]
-    page_key = f"dlg_page_{job.id}"
-    runs = {job.id: job}
-
-    ctrl_l, ctrl_r = st.columns([3, 1], vertical_alignment="bottom")
-    with ctrl_l:
-        sort_by = render_sort_selectbox(f"dlg_sort_{job.id}", page_key=page_key)
-    with ctrl_r:
-        only_passed = st.toggle("Passed only", value=bool(passed),
-                                key=f"dlg_pass_{job.id}",
-                                on_change=_reset_modal_page,
-                                args=(page_key,))
-    shown = [r for r in reports if r.passed] if only_passed else reports
-    shown = sort_reports(shown, sort_by, runs=runs)
-
-    st.caption(f":green[{len(passed)} passed] · {len(reports) - len(passed)} "
-               f"failed · {len(reports)} evaluated")
-
-    page_reports, page, total_pages = _page_slice(
-        shown, page_key, _MODAL_PAGE_SIZE)
-    render_page_controls(page_key, page, total_pages, len(shown),
-                         _MODAL_PAGE_SIZE, control_key=f"dlg_nav_{job.id}")
-    render_report_grid(page_reports, {}, storage=storage,
-                       key_prefix=f"run_{job.id}_", compact=True)
-
-    st.caption("Open the **Strategy Gallery** tab for full cards, walk-forward "
-               "detail and one-click MQL5 export.")
-
-
-def _reset_modal_page(page_key: str) -> None:
-    st.session_state[page_key] = 0
-
-
 def _render_running_progress(job) -> None:
-    """Live, determinate progress for an in-flight discovery run.
-
-    Reads the counters the worker persists on each candidate (tested/promising/
-    survivors/generation) so the 2s fragment refresh shows steady progress.
-    Falls back to an indeterminate 'starting' state for the brief window before
-    the first candidate has been screened.
-    """
     max_candidates = int(job.payload.get("max_candidates", 0) or 0)
     target_survivors = int(job.payload.get("target_survivors", 0) or 0)
 
     if getattr(job, "cancel_requested", False):
         st.warning("Cancelling — stopping after the current backtest…")
 
-    # Read live counters defensively: a Streamlit process that imported an
-    # older Job model (before these fields shipped) would otherwise raise
-    # AttributeError and crash the whole panel on every 2s refresh.
     tested = int(getattr(job, "tested", 0) or 0)
     promising = int(getattr(job, "promising", 0) or 0)
     survivors = int(getattr(job, "survivors", 0) or 0)
     generation = int(getattr(job, "generation", 0) or 0)
 
+    pct = min(max(job.progress, 0.0), 1.0) * 100.0
     if tested <= 0:
-        st.progress(min(max(job.progress, 0.0), 1.0),
-                    text=job.message or "starting…")
-        return
+        progress_label = job.message or "starting…"
+    else:
+        progress_label = f"gen {generation} · {promising} promising"
 
-    st.progress(min(max(job.progress, 0.0), 1.0),
-                text=f"generation {generation} · {promising} promising")
+    pie_col, stats_col = st.columns([1, 2], vertical_alignment="center")
+    with pie_col:
+        render_pie_progress(pct, label=progress_label, size=156)
+    with stats_col:
+        elapsed = max(time.time() - job.created_at, 1e-6)
+        passed_txt = (f"{survivors} / {target_survivors}"
+                      if target_survivors else str(survivors))
+        tested_txt = (f"{tested} / {max_candidates}"
+                      if max_candidates else str(tested))
+        eta_txt = _estimate_eta(job, max_candidates, target_survivors, elapsed)
 
-    elapsed = max(time.time() - job.created_at, 1e-6)
-    passed_txt = (f"{survivors} / {target_survivors}"
-                  if target_survivors else str(survivors))
-    tested_txt = (f"{tested} / {max_candidates}"
-                  if max_candidates else str(tested))
-    eta_txt = _estimate_eta(job, max_candidates, target_survivors, elapsed)
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Passed", passed_txt,
+                  help="Strategies that cleared every gate.")
+        m2.metric("Tested", tested_txt,
+                  help="Candidates screened so far.")
+        m3.metric("Est. time to target", eta_txt,
+                  help="Estimate for whichever limit is hit first — the "
+                       "target number of winners or the max candidates.")
 
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Passed", passed_txt, help="Strategies that cleared every gate.")
-    m2.metric("Tested", tested_txt, help="Candidates screened so far.")
-    m3.metric("Est. time to target", eta_txt,
-              help="Estimate for whichever limit is hit first — the target "
-                   "number of winners or the max candidates.")
-
-    rate = tested / elapsed * 60.0
-    st.caption(f"elapsed {_fmt_duration(elapsed)} · {rate:.0f} tested/min")
+        rate = tested / elapsed * 60.0 if tested > 0 else 0.0
+        if tested > 0:
+            st.caption(f"elapsed {_fmt_duration(elapsed)} · "
+                       f"{rate:.0f} tested/min")
+        else:
+            st.caption(job.message or "warming up…")
 
 
 def _estimate_eta(job, max_candidates: int, target_survivors: int,
                   elapsed: float) -> str:
-    """Estimate the time until the run finishes.
-
-    A run stops when EITHER the target survivor count OR the max-candidate
-    ceiling is reached, so the ETA is the sooner of the two projections based
-    on the observed throughput. Returns a short human string (or a placeholder
-    while there isn't enough signal to project yet).
-    """
     tested = int(getattr(job, "tested", 0) or 0)
     survivors = int(getattr(job, "survivors", 0) or 0)
     etas: list[float] = []
@@ -626,52 +846,125 @@ def _fmt_duration(seconds: float) -> str:
 
 
 def _request_cancel(queue: JobQueue, job_id: str) -> None:
-    """Cancel callback.
-
-    Using ``on_click`` (instead of checking the button's return value) makes
-    the click reliable inside the auto-rerunning ``run_every`` fragment: the
-    callback is guaranteed to run on the interaction, with no race against the
-    2-second refresh.
-    """
     queue.cancel(job_id)
     st.toast(f"Cancellation requested for {job_id}")
 
 
-def _render_discovery_agent_panel(storage: Storage) -> None:
-    """Detached discovery-agent controls and alert settings."""
-    state = storage.get_agent_state()
-    app_cfg = storage.get_app_settings()
-    st.subheader(":material/smart_toy: Discovery agent")
-    with st.container(border=True):
-        s1, s2, s3, s4 = st.columns(4)
-        s1.metric("Status", str(state.get("status", "stopped")))
-        hb = state.get("heartbeat_at")
-        hb_txt = "never" if not hb else datetime.fromtimestamp(hb).strftime("%H:%M:%S")
-        s2.metric("Heartbeat", hb_txt)
-        s3.metric("Queue depth", int(state.get("queue_depth", 0) or 0))
-        s4.metric("Sweeps submitted", int(state.get("jobs_submitted", 0) or 0))
+def _render_run_history(storage: Storage) -> None:
+    finished = [j for j in storage.list_jobs("discovery")
+                if j.status not in _ACTIVE]
+    if not finished:
+        return
 
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button(":material/play_arrow: Start agent", width="stretch"):
-                storage.update_agent_state(enabled=1, status="starting")
-                started = start_orchestrator_process()
-                if started:
-                    st.success("Discovery agent service started.")
-                else:
-                    st.info("Discovery agent already running.")
-                st.rerun()
-        with c2:
-            if st.button(":material/stop: Stop agent", width="stretch"):
-                stop_orchestrator_process()
-                st.warning("Stop requested for discovery agent.")
-                st.rerun()
+    recent = finished[:10]
+    counts = storage.count_validated_by_jobs([j.id for j in recent])
 
-        st.markdown("#### Agent settings")
-        st.caption(
-            "Configure what the discovery agent searches, how aggressive each run is, "
-            "and when it sends notifications."
+    with st.expander(
+        f":material/history: Recent runs ({len(finished)})",
+        expanded=False,
+    ):
+        for job in recent:
+            badge = _STATUS_STYLE.get(job.status, (job.status.value,))[0]
+            passed, total = counts.get(job.id, (0, 0))
+            with st.container(border=True):
+                left, mid, right = st.columns([3, 4, 2], vertical_alignment="center")
+                with left:
+                    st.markdown(f"**`{job.id}`**")
+                    st.caption(job_summary(job))
+                with mid:
+                    st.markdown(badge)
+                    if job.message:
+                        st.caption(job.message)
+                    if total:
+                        st.caption(f":green[{passed} passed] · {total} evaluated")
+                with right:
+                    if st.button(
+                            f":material/insights: Results ({total})",
+                            key=f"results_{job.id}", width="stretch",
+                            disabled=total == 0,
+                            help=("This run's strategies."
+                                  if total else "No evaluated strategies.")):
+                        _results_dialog(storage, job)
+                    if job.error:
+                        with st.expander("Issue"):
+                            st.code(job.error)
+
+
+@st.dialog("Run results", width="large")
+def _results_dialog(storage: Storage, job) -> None:
+    from app.components.strategy_card import (
+        SORT_OPTION_LABELS,
+        _MODAL_PAGE_SIZE,
+        _hydrate_reports,
+        render_page_controls,
+        render_report_grid,
+        render_sort_selectbox,
+        sort_reports,
+        _page_slice,
+    )
+
+    st.markdown(f"**`{job.id}`** · {job_summary(job)}")
+    page_key = f"dlg_page_{job.id}"
+    runs = {job.id: job}
+    passed_n, _total_n = storage.count_validated(job.id)
+
+    ctrl_l, ctrl_r = st.columns([3, 1], vertical_alignment="bottom")
+    with ctrl_l:
+        sort_by = render_sort_selectbox(f"dlg_sort_{job.id}", page_key=page_key)
+    with ctrl_r:
+        only_passed = st.toggle(
+            "Passed only",
+            value=passed_n > 0,
+            key=f"dlg_pass_{job.id}",
+            on_change=_reset_modal_page,
+            args=(page_key,),
         )
+
+    column_sorts = {
+        "WFE (high → low)",
+        "Run (newest → oldest)",
+        "Run (oldest → newest)",
+    }
+    if sort_by not in SORT_OPTION_LABELS:
+        sort_by = SORT_OPTION_LABELS[0]
+    need_metrics = sort_by not in column_sorts
+
+    reports = storage.list_validation_summaries(
+        passed_only=None,
+        job_id=job.id,
+        include_body_metrics=need_metrics,
+    )
+    if not reports:
+        st.info("This run produced no evaluated strategies.")
+        return
+
+    passed = [r for r in reports if r.passed]
+    # Default "Passed only" on when the run has survivors; keep widget value.
+    shown = [r for r in reports if r.passed] if only_passed else reports
+    shown = sort_reports(shown, sort_by, runs=runs)
+
+    st.caption(f":green[{len(passed)} passed] · {len(reports) - len(passed)} "
+               f"failed · {len(reports)} evaluated")
+
+    page_reports, page, total_pages = _page_slice(
+        shown, page_key, _MODAL_PAGE_SIZE)
+    render_page_controls(page_key, page, total_pages, len(shown),
+                         _MODAL_PAGE_SIZE, control_key=f"dlg_nav_{job.id}")
+    full_page = _hydrate_reports(storage, page_reports)
+    render_report_grid(full_page, {}, storage=storage,
+                       key_prefix=f"run_{job.id}_", compact=True)
+
+    st.caption("Open the **Strategy gallery** tab for full cards, walk-forward "
+               "detail and one-click MQL5 export.")
+
+
+def _reset_modal_page(page_key: str) -> None:
+    st.session_state[page_key] = 0
+
+
+def _render_email_tools(storage: Storage) -> None:
+    app_cfg = storage.get_app_settings()
+    with st.expander(":material/mail: Email delivery", expanded=False):
         smtp_diag_key = "smtp_diag_refresh_nonce"
         st.session_state.setdefault(smtp_diag_key, 0)
         smtp_diag = smtp_diagnostics()
@@ -692,183 +985,25 @@ def _render_discovery_agent_panel(storage: Storage) -> None:
             st.session_state[smtp_diag_key] = int(st.session_state[smtp_diag_key]) + 1
             st.rerun()
 
-        with st.form("agent_settings_form"):
-            st.markdown("##### :material/tune: Notifications")
-            n1, n2, n3 = st.columns(3)
-            with n1:
-                recipient = st.text_input(
-                    "Alert recipient email",
-                    value=str(app_cfg.get("recipient_email", settings.DEFAULT_ALERT_RECIPIENT)),
-                    help="Where pass alerts and promotion notifications are sent.",
-                )
-            with n2:
-                min_score = st.number_input(
-                    "Minimum quality score to alert",
-                    min_value=0.0,
-                    max_value=100.0,
-                    value=float(app_cfg.get("alert_min_score", 70.0)),
-                    step=1.0,
-                    help="Only strategies scoring at or above this value trigger an email.",
-                )
-            with n3:
-                cooldown_min = st.number_input(
-                    "Alert cooldown (minutes)",
-                    min_value=1,
-                    max_value=10_000,
-                    value=int(app_cfg.get("alert_cooldown_minutes", 60)),
-                    step=1,
-                    help="Minimum time between alert emails.",
-                )
-
-            st.markdown("##### :material/travel_explore: What to search")
-            s1, s2, s3 = st.columns(3)
-            with s1:
-                symbols = st.multiselect(
-                    "Symbols",
-                    options=list(settings.SYMBOLS),
-                    default=list(app_cfg.get("agent_symbols", settings.SYMBOLS[:5])),
-                    help="Instruments the agent will sweep.",
-                )
-            with s2:
-                tf = st.multiselect(
-                    "Timeframes",
-                    options=["M1", "M5", "M15", "M30", "H1", "H4", "D1"],
-                    default=list(app_cfg.get("agent_timeframes", ["M15", "H1"])),
-                    help="Chart intervals included in each sweep.",
-                )
-            with s3:
-                strictness = st.multiselect(
-                    "Validation strictness",
-                    options=["easy", "normal", "hard", "custom"],
-                    default=list(app_cfg.get(
-                        "agent_strictness_profiles",
-                        ["easy", "normal", "hard", "custom"],
-                    )),
-                    help="Gate profiles used during validation.",
-                )
-
-            st.markdown("##### :material/schedule: Run budget")
-            b1, b2, b3, b4 = st.columns(4)
-            with b1:
-                months = st.number_input(
-                    "History (months)",
-                    min_value=1,
-                    max_value=36,
-                    value=int(app_cfg.get("agent_history_months", 12)),
-                    step=1,
-                    help="Backtest window length used by the agent.",
-                )
-            with b2:
-                agent_batch = st.number_input(
-                    "Batch size",
-                    min_value=10,
-                    max_value=5000,
-                    value=int(app_cfg.get("agent_batch_size", 100)),
-                    help="Candidates generated per generation.",
-                )
-            with b3:
-                agent_max = st.number_input(
-                    "Max candidates",
-                    min_value=10,
-                    max_value=100000,
-                    value=int(app_cfg.get("agent_max_candidates", 1000)),
-                    help="Hard cap per sweep.",
-                )
-            with b4:
-                agent_target = st.number_input(
-                    "Target survivors",
-                    min_value=1,
-                    max_value=100,
-                    value=int(app_cfg.get("agent_target_survivors", 2)),
-                    help="Stop once this many passing strategies are found.",
-                )
-
-            with st.expander(":material/science: Advanced generation options"):
-                st.caption(
-                    "These control search sophistication. Defaults are good for most runs."
-                )
-                ag1, ag2, ag3 = st.columns(3)
-                with ag1:
-                    agent_advanced_mode = st.checkbox(
-                        "Enable advanced mode",
-                        value=bool(app_cfg.get("agent_advanced_mode", True)),
-                        help="Turns on richer building blocks and search operators.",
-                    )
-                with ag2:
-                    agent_complexity_cap = st.slider(
-                        "Complexity cap",
-                        2,
-                        10,
-                        int(app_cfg.get("agent_complexity_cap", 6)),
-                        help="Upper bound on strategy complexity.",
-                    )
-                with ag3:
-                    agent_regime = st.checkbox(
-                        "Enable regime switching",
-                        value=bool(app_cfg.get("agent_enable_regime_switching", True)),
-                        help="Allow market-regime-aware variants.",
-                    )
-                agent_mtf = st.checkbox(
-                    "Enable multi-timeframe context",
-                    value=bool(app_cfg.get("agent_enable_mtf_context", True)),
-                    help="Use higher/lower timeframe context as additional signals.",
-                )
-                agent_feature_toggles = st.multiselect(
-                    "Feature families",
-                    options=["momentum", "mean_reversion", "volatility", "market_structure"],
-                    default=list(app_cfg.get(
-                        "agent_feature_toggles",
-                        ["momentum", "mean_reversion", "volatility", "market_structure"],
-                    )),
-                    help="Signal families the generator may include.",
-                )
-
-            save = st.form_submit_button(
-                ":material/save: Save agent settings",
-                type="primary",
-                width="stretch",
-            )
-            if save:
-                storage.upsert_app_settings(
-                    {
-                        "recipient_email": recipient.strip(),
-                        "alert_min_score": float(min_score),
-                        "alert_cooldown_minutes": int(cooldown_min),
-                        "agent_timeframes": list(tf) or ["M15", "H1"],
-                        "agent_strictness_profiles": list(strictness) or ["normal"],
-                        "agent_history_months": int(months),
-                        "agent_symbols": list(symbols) or settings.SYMBOLS[:5],
-                        "agent_batch_size": int(agent_batch),
-                        "agent_max_candidates": int(agent_max),
-                        "agent_target_survivors": int(agent_target),
-                        "agent_advanced_mode": bool(agent_advanced_mode),
-                        "agent_complexity_cap": int(agent_complexity_cap),
-                        "agent_enable_regime_switching": bool(agent_regime),
-                        "agent_enable_mtf_context": bool(agent_mtf),
-                        "agent_feature_toggles": list(agent_feature_toggles)
-                        or ["momentum", "mean_reversion", "volatility", "market_structure"],
-                    }
-                )
-                st.success("Discovery agent settings saved.")
-                st.rerun()
-        test_default_recipient = str(app_cfg.get("recipient_email", settings.DEFAULT_ALERT_RECIPIENT)).strip()
+        test_default_recipient = str(
+            app_cfg.get("recipient_email", settings.DEFAULT_ALERT_RECIPIENT)
+        ).strip()
         test_recipient_override = st.text_input(
             "Test email recipient (optional override)",
             value=test_default_recipient,
             key="test_email_recipient_override",
-            help="Used only for the test send button below.",
         )
         if st.button("Send test email", key="send_test_email"):
             recipient = test_recipient_override.strip() or test_default_recipient
             if not recipient:
                 st.error("Set an alert recipient email first, then retry.")
-                return
-            try:
-                send_email(
-                    recipient,
-                    "EA Generator test email",
-                    "This is a test email from the EA Generator discovery agent.",
-                )
-                st.success(f"Test email sent to {recipient}.")
-            except Exception as exc:
-                st.error(f"Test email failed: {exc}")
+            else:
+                try:
+                    send_email(
+                        recipient,
+                        "EA Generator test email",
+                        "This is a test email from the EA Generator discovery agent.",
+                    )
+                    st.success(f"Test email sent to {recipient}.")
+                except Exception as exc:
+                    st.error(f"Test email failed: {exc}")

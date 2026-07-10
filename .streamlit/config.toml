@@ -1,11 +1,7 @@
-# Permanent dark mode.
-# Defining ONLY [theme] (no [theme.light]) locks the app to a single mode, so
-# the app is always dark regardless of the viewer's OS/browser preference.
-# Palette: professional "financial dashboard" dark theme.
+# Permanent dark mode — trading-terminal palette (charcoal + amber + teal).
+# Defining ONLY [theme] locks the app to dark regardless of OS preference.
 
 [client]
-# Hide developer chrome (Deploy, Rerun, Clear cache) from the top-right
-# toolbar — keeps the app looking like a finished product dashboard.
 toolbarMode = "minimal"
 
 [browser]
@@ -13,18 +9,18 @@ gatherUsageStats = false
 
 [theme]
 base = "dark"
-primaryColor = "#60A5FA"             # Bright blue
-backgroundColor = "#0F172A"          # Deep slate
-secondaryBackgroundColor = "#1E293B" # Slightly lighter slate (cards, widgets)
-codeBackgroundColor = "#1E293B"
-textColor = "#F1F5F9"                # Light text
-linkColor = "#60A5FA"
-borderColor = "#334155"
+primaryColor = "#D4A853"
+backgroundColor = "#0B0F14"
+secondaryBackgroundColor = "#141A22"
+codeBackgroundColor = "#1A222D"
+textColor = "#E8EAED"
+linkColor = "#2DD4BF"
+borderColor = "#2A3441"
 codeTextColor = "#CBD5E1"
 showWidgetBorder = true
 showSidebarBorder = true
-baseRadius = "8px"
-buttonRadius = "8px"
+baseRadius = "10px"
+buttonRadius = "10px"
 
 font = "'Inter':https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
 headingFont = "'Inter':https://fonts.googleapis.com/css2?family=Inter:wght@600;700&display=swap"
@@ -36,31 +32,30 @@ headingFontSizes = ["28px", "22px", "18px", "16px", "14px", "12px"]
 headingFontWeights = [700, 600, 600, 600, 500, 500]
 linkUnderline = false
 
-# Semantic colors for financial indicators
-greenColor = "#34D399"   # Gains / PASS
-redColor = "#F87171"     # Losses / FAIL
-yellowColor = "#FBBF24"
+greenColor = "#2DD4BF"
+redColor = "#F87171"
+yellowColor = "#D4A853"
 orangeColor = "#FB923C"
-blueColor = "#60A5FA"
+blueColor = "#38BDF8"
 violetColor = "#A78BFA"
-grayColor = "#94A3B8"
+grayColor = "#8B95A5"
 
 chartCategoricalColors = [
-    "#60A5FA", "#34D399", "#A78BFA", "#F87171",
-    "#FBBF24", "#38BDF8", "#94A3B8", "#FB923C",
+    "#D4A853", "#2DD4BF", "#A78BFA", "#F87171",
+    "#FB923C", "#38BDF8", "#8B95A5", "#14B8A6",
 ]
 chartSequentialColors = [
-    "#0C4A6E", "#075985", "#0369A1", "#0284C7", "#0EA5E9",
-    "#38BDF8", "#7DD3FC", "#BAE6FD", "#E0F2FE", "#F0F9FF",
+    "#0B0F14", "#141A22", "#1A222D", "#243040", "#2A3441",
+    "#3D4F63", "#5A6B7D", "#8B95A5", "#C4CAD4", "#E8EAED",
 ]
 
-dataframeBorderColor = "#334155"
-dataframeHeaderBackgroundColor = "#1E293B"
+dataframeBorderColor = "#2A3441"
+dataframeHeaderBackgroundColor = "#1A222D"
 
 [theme.sidebar]
-backgroundColor = "#0F172A"
-secondaryBackgroundColor = "#1E293B"
-codeBackgroundColor = "#1E293B"
-textColor = "#F1F5F9"
-borderColor = "#334155"
-primaryColor = "#60A5FA"
+backgroundColor = "#0B0F14"
+secondaryBackgroundColor = "#141A22"
+codeBackgroundColor = "#1A222D"
+textColor = "#E8EAED"
+borderColor = "#2A3441"
+primaryColor = "#D4A853"

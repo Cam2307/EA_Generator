@@ -16,6 +16,32 @@ run_dashboard.bat
 
 or manually: `.venv\Scripts\streamlit run app\dashboard.py`.
 
+## Discovery runs
+
+The **Discovery** tab is a single panel: live status, configuration, and controls
+all live in one bordered container. Every sweep goes through the same pipeline
+(`build_discovery_payload` → `JobQueue.submit_discovery` → `_run_discovery`), so
+engine, mechanics, account economics, validation level, walk-forward windows,
+and advanced generation options are identical across runs.
+
+| Control | What it does |
+|---------|----------------|
+| **Start discovery** | Saves settings and starts the orchestrator. It cycles through every selected **symbol × timeframe** pair continuously until you stop. Sends an hourly progress digest and one-time alerts for exceptional strategies (SMTP via `EA_SMTP_*` env vars). |
+| **Stop discovery** | Appears while a run is active. Stops the orchestrator after the current sweep; use **Stop** on the in-flight job card to cancel the active backtest immediately. |
+
+### How to use
+
+1. Configure **symbols**, **timeframes**, **validation**, **engine**, **mechanics**,
+   and the rest of the options in the discovery panel.
+2. Press **Start discovery** — the orchestrator cycles through every
+   symbol×timeframe pair with identical settings and sends hourly progress emails.
+3. Press **Stop discovery** when you want the cycle to end after the current sweep.
+
+Sweep scope is the cartesian product of the selected symbols and timeframes
+(e.g. 3 symbols × 2 timeframes = 6 sweeps per cycle). Only one discovery job
+runs at a time; the orchestrator queues the next combination when the current
+job completes.
+
 ## Architecture
 
 ```
@@ -28,12 +54,18 @@ factory/backtest/mt5_runner.py   Headless MT5: compile via metaeditor64, tester 
 factory/backtest/simulator.py    Event-driven bar-by-bar fallback engine (stateful PositionBook)
 factory/backtest/validation.py   70/30 IS/OOS, WFO, acceptance gates, MC gate
 factory/backtest/montecarlo.py   Monte Carlo robustness testing
+factory/discovery_config.py   Shared discovery settings + job payload builder
+factory/agent_alerts.py       Hourly progress digests + quality alerts for the agent
 docs/ea_studio_reference.md      EA Studio benchmark notes
 docs/mql5_validator_checklist.md MQL5 Market validator checklist
 factory/mql5/renderer.py    Validator-proof .mq5 assembly from templates/
 factory/assets/             .set writer, marketplace .md writer, package exporter
 jobs/worker.py              Singleton JobQueue, single-slot MT5 lane, SQLite-persisted progress
+jobs/orchestrator.py        Detached discovery agent (batch + continuous sweep modes)
+jobs/sweep.py               Symbol × timeframe sweep planner
+scripts/discovery_agent_service.py  Orchestrator entry point (spawned by the dashboard)
 app/dashboard.py            Streamlit UI (discovery, gallery, export)
+app/components/discovery_panel.py   Unified discovery form, live progress, agent controls
 data/ reports/ output/      Runtime artifacts (git-ignored)
 ```
 

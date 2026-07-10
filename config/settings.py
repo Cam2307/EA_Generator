@@ -37,15 +37,17 @@ MIN_PROFIT_FACTOR = 0.0      # 0 disables the gate
 MIN_SHARPE = 0.0             # 0 disables the gate
 MIN_R_SQUARED = 0.0          # 0 disables the gate (equity-curve stability)
 MAX_CONSECUTIVE_LOSSES = 0   # 0 disables the gate
-WFO_WINDOWS = 3              # walk-forward windows per mode (anchored + rolling)
-WFO_TRAIN_MONTHS = 2         # rolling WFO in-sample window (calendar months)
-WFO_TEST_MONTHS = 1          # rolling WFO out-of-sample window (calendar months)
-OPT_SAMPLES = 8              # random parameter samples for IS optimization
-WFO_OPT_SAMPLES = 3          # lighter sampling inside each WFO window
+DAYS_PER_MONTH = 30.4375     # shared month length for history + WFO folds
+WFO_WINDOWS = 2              # default walk-forward windows (auto-derived from duration)
+WFO_TRAIN_MONTHS = 2         # default rolling WFO IS window (auto-derived from duration)
+WFO_TEST_MONTHS = 1          # default rolling WFO OOS window (auto-derived from duration)
+WFO_MODES = ("rolling",)     # "anchored" + "rolling" doubles WFO cost
+OPT_SAMPLES = 12             # random parameter samples for IS optimization
+WFO_OPT_SAMPLES = 6          # lighter sampling inside each WFO window
 
 # Over-fitting protection in the optimizer: score a candidate parameter set
 # by the average fitness of its +/-1-step neighbors instead of its own peak.
-NEIGHBORHOOD_STABILITY = True
+NEIGHBORHOOD_STABILITY = False
 NEIGHBOR_SAMPLES = 4         # neighbors evaluated per top candidate
 NEIGHBOR_TOP_K = 3           # top raw candidates re-scored by neighborhood
 
@@ -94,8 +96,9 @@ SYMBOLS = [
 
 # Discovery-agent defaults (persisted overrides live in SQLite app_settings).
 DEFAULT_ALERT_RECIPIENT = "camdwg@gmail.com"
-DEFAULT_ALERT_MIN_SCORE = 70.0
+DEFAULT_ALERT_MIN_SCORE = 80.0
 DEFAULT_ALERT_COOLDOWN_MINUTES = 60
+DEFAULT_PROGRESS_EMAIL_HOURS = 1.0
 
 
 def ensure_dirs() -> None:
