@@ -44,8 +44,13 @@ class SymbolSpec:
     point: float = 0.00001            # minimal price increment
     contract_size: float = 100_000.0
     leverage: float = 100.0
-    spread_points: float = 15.0       # applied on every entry fill
-    slippage_points: float = 2.0      # adverse slippage per fill
+    spread_points: float = 15.0       # typical (London-session) entry spread
+    slippage_points: float = 2.0      # typical adverse slippage per fill
+    # Session-aware cost model: scale spread by hour-of-day/weekday and
+    # slippage by realized volatility (see factory.backtest.costs). Enabled
+    # by default when the spec is inferred from data; tests that build a
+    # spec directly keep the flat static costs.
+    dynamic_costs: bool = False
 
     @property
     def point_value(self) -> float:
@@ -69,10 +74,12 @@ class SymbolSpec:
         the inferred defaults, so ``infer`` never clobbers user-provided
         values while still auto-detecting the point size.
         """
+        from config import settings
         if price < 20:                # 5-digit FX
             spec = cls(point=0.00001)
         else:
             spec = cls(point=0.01, contract_size=100.0, spread_points=20.0)
+        spec.dynamic_costs = getattr(settings, "SIMULATOR_DYNAMIC_COSTS", True)
         if overrides:
             for name in cls.OVERRIDABLE:
                 value = overrides.get(name)
@@ -117,16 +124,26 @@ class PositionBook:
     closed: List[ClosedTrade] = field(default_factory=list)
 
     # -- costs ---------------------------------------------------------
-    def fill_price(self, direction: int, bid: float) -> float:
-        """Entry fill: buys pay spread + slippage above bid; sells slip below."""
-        cost_points = (self.spec.spread_points if direction > 0 else 0.0) + self.spec.slippage_points
+    def fill_price(self, direction: int, bid: float,
+                   spread_points: Optional[float] = None,
+                   slippage_points: Optional[float] = None) -> float:
+        """Entry fill: buys pay spread + slippage above bid; sells slip below.
+
+        ``spread_points`` / ``slippage_points`` override the spec's static
+        costs for this fill — used by the session-aware dynamic cost model.
+        """
+        spread = self.spec.spread_points if spread_points is None else spread_points
+        slip = self.spec.slippage_points if slippage_points is None else slippage_points
+        cost_points = (spread if direction > 0 else 0.0) + slip
         return bid + direction * cost_points * self.spec.point
 
     # -- lifecycle ------------------------------------------------------
     def open(self, direction: int, lots: float, bid: float, time_s: float,
              sl_points: float = 0.0, tp_points: float = 0.0,
-             is_hedge: bool = False, grid_level: int = 0) -> Optional[Position]:
-        price = self.fill_price(direction, bid)
+             is_hedge: bool = False, grid_level: int = 0,
+             spread_points: Optional[float] = None,
+             slippage_points: Optional[float] = None) -> Optional[Position]:
+        price = self.fill_price(direction, bid, spread_points, slippage_points)
         margin_needed = lots * self.spec.contract_size * price / self.spec.leverage
         if self.equity(bid) - self.margin_used(bid) < margin_needed:
             return None                                   # margin refusal
@@ -584,6 +601,56 @@ def compute_signals(df: pd.DataFrame, strategy: StrategyDefinition,
 
 
 # ---------------------------------------------------------------------------
+# Intrabar exit resolution
+# ---------------------------------------------------------------------------
+# "Which was hit first, the stop or the target?" is unanswerable from a single
+# OHLC bar when both levels sit inside its range. Three resolution modes,
+# increasing in fidelity:
+#
+# - "conservative": legacy behavior — SL always assumed first (pessimistic).
+# - "path": the classic OHLC path heuristic — a bullish bar is assumed to
+#   trade open -> low -> high -> close, a bearish bar open -> high -> low ->
+#   close; the first level touched along that path wins. Matches the shape
+#   assumption of MT5's own "1 minute OHLC" tick model one level up.
+# - "m1": real M1 bars are replayed inside each strategy-timeframe bar (each
+#   M1 bar expanded by the same path heuristic), so exit ordering follows the
+#   actual sub-bar path. Falls back to "path" when M1 data is unavailable or
+#   the series is synthetic (a synthetic M1 walk is unrelated to the
+#   synthetic M15 walk, so replaying it would be noise, not fidelity).
+
+def _path_points(o: float, h: float, l: float, c: float) -> Tuple[float, ...]:
+    """Assumed monotonic price pivots inside one bar (OHLC path heuristic)."""
+    if c >= o:
+        return (o, l, h, c)
+    return (o, h, l, c)
+
+
+def _first_touch_exit(pos: Position, points: Tuple[float, ...]) -> Optional[float]:
+    """First SL/TP level touched walking the piecewise-monotonic path.
+
+    Level checks are direction-aware "reached or exceeded" tests (long SL
+    triggers whenever price <= SL), so a bar that *gaps* through a level —
+    the path starting already beyond it — still exits. When both levels are
+    reached inside one segment, the one touched earlier along the travel
+    from the segment start wins; an exact tie goes to the SL (conservative).
+    """
+    d, sl, tp = pos.direction, pos.sl, pos.tp
+    for a, b in zip(points[:-1], points[1:]):
+        lo, hi = (a, b) if a <= b else (b, a)
+        # (distance-along-path-to-touch, tie-priority, level-price)
+        cands = []
+        if sl > 0.0 and ((d > 0 and lo <= sl) or (d < 0 and hi >= sl)):
+            already = (a <= sl) if d > 0 else (a >= sl)
+            cands.append((0.0 if already else abs(a - sl), 0, sl))
+        if tp > 0.0 and ((d > 0 and hi >= tp) or (d < 0 and lo <= tp)):
+            already = (a >= tp) if d > 0 else (a <= tp)
+            cands.append((0.0 if already else abs(a - tp), 1, tp))
+        if cands:
+            return min(cands)[2]
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Trade-management (exit / risk overlay) helpers
 # ---------------------------------------------------------------------------
 
@@ -688,6 +755,17 @@ class SimulatorEngine(BacktestEngine):
     def run(self, strategy: StrategyDefinition, start: datetime, end: datetime,
             params_override: Optional[Dict[str, float]] = None,
             deposit: float = 10_000.0) -> BacktestMetrics:
+        metrics, _, _ = self.run_with_trades(strategy, start, end,
+                                             params_override, deposit)
+        return metrics
+
+    def run_with_trades(self, strategy: StrategyDefinition, start: datetime,
+                        end: datetime,
+                        params_override: Optional[Dict[str, float]] = None,
+                        deposit: float = 10_000.0
+                        ) -> Tuple[BacktestMetrics, PositionBook, pd.DataFrame]:
+        """Like :meth:`run` but also returns the trade book and bar data —
+        used by per-regime validation breakdowns."""
         if params_override:
             strategy = strategy.apply_flat_params(params_override)
 
@@ -700,8 +778,25 @@ class SimulatorEngine(BacktestEngine):
 
         spec = self._spec_override or SymbolSpec.infer(
             float(df["close"].iloc[0]), self._spec_overrides)
-        return simulate(df, strategy, spec, deposit,
-                        cancel_check=self._cancel_check)
+
+        from config import settings
+        mode = getattr(settings, "SIMULATOR_INTRABAR_MODE", "path")
+        intrabar_df = None
+        if (mode == "m1" and strategy.timeframe != "M1"
+                and self._ohlc_override is None
+                and df.attrs.get("source") not in (None, "synthetic")):
+            # Real data only: a synthetic M1 walk is unrelated to the
+            # synthetic strategy-TF walk, so replaying it would inject noise.
+            try:
+                intrabar_df = data_mod.load_ohlc(
+                    strategy.symbol, "M1", start, end, allow_synthetic=False)
+            except Exception:
+                intrabar_df = None      # fall back to the path heuristic
+
+        metrics, book = run_simulation(
+            df, strategy, spec, deposit, cancel_check=self._cancel_check,
+            intrabar_mode=mode, intrabar_df=intrabar_df)
+        return metrics, book, df
 
 
 def simulate(df: pd.DataFrame, strategy: StrategyDefinition, spec: SymbolSpec,
@@ -714,7 +809,9 @@ def simulate(df: pd.DataFrame, strategy: StrategyDefinition, spec: SymbolSpec,
 def run_simulation(df: pd.DataFrame, strategy: StrategyDefinition,
                    spec: SymbolSpec, deposit: float,
                    entry_mask: Optional[np.ndarray] = None,
-                   cancel_check: CancelCheck = None
+                   cancel_check: CancelCheck = None,
+                   intrabar_mode: str = "path",
+                   intrabar_df: Optional[pd.DataFrame] = None
                    ) -> Tuple[BacktestMetrics, PositionBook]:
     """Bar-by-bar event loop. Only signal arrays are precomputed.
 
@@ -725,6 +822,10 @@ def run_simulation(df: pd.DataFrame, strategy: StrategyDefinition,
     ``cancel_check`` is polled every few thousand bars so a cancelled job
     aborts a long backtest promptly (raising :class:`JobCancelled`) instead of
     grinding to the end of the data first.
+
+    ``intrabar_mode`` selects how same-bar SL/TP ambiguity is resolved
+    ("conservative" | "path" | "m1" — see the intrabar helpers above);
+    ``intrabar_df`` supplies the M1 bars for "m1" mode.
 
     Returns the final PositionBook too so tests can assert fill sequences.
     """
@@ -749,12 +850,86 @@ def run_simulation(df: pd.DataFrame, strategy: StrategyDefinition,
     max_open_lots = strategy.risk.max_open_lots
     base_lots = strategy.risk.fixed_lots
 
+    # Session-aware dynamic execution costs (see factory.backtest.costs).
+    # Per-bar spread/slippage arrays; None keeps the flat static spec costs.
+    if spec.dynamic_costs:
+        from factory.backtest.costs import build_cost_arrays
+        spread_arr, slip_arr = build_cost_arrays(
+            df, spec.spread_points, spec.slippage_points)
+    else:
+        spread_arr = slip_arr = None
+    max_spread = strategy.risk.max_spread_points
+
+    def _bar_costs(i: int):
+        if spread_arr is None:
+            return None, None
+        return float(spread_arr[i]), float(slip_arr[i])
+
+    # -- intrabar exit-path precompute --------------------------------------
+    # For "m1" mode, map each strategy bar i to its slice [m1_lo[i], m1_hi[i])
+    # of the M1 arrays via searchsorted on timestamps.
+    m1_opens = m1_highs = m1_lows = m1_closes = None
+    m1_lo = m1_hi = None
+    if intrabar_mode == "m1" and intrabar_df is not None and len(intrabar_df):
+        _m1t = pd.to_datetime(intrabar_df["time"], utc=True).dt.tz_localize(None)
+        m1_times = _m1t.to_numpy().astype("datetime64[s]").astype("int64")
+        m1_opens = intrabar_df["open"].to_numpy()
+        m1_highs = intrabar_df["high"].to_numpy()
+        m1_lows = intrabar_df["low"].to_numpy()
+        m1_closes = intrabar_df["close"].to_numpy()
+        _t_main = pd.to_datetime(df["time"], utc=True).dt.tz_localize(None)
+        bar_times = _t_main.to_numpy().astype("datetime64[s]").astype("int64")
+        bar_len = int(np.median(np.diff(bar_times))) if len(bar_times) > 1 else 60
+        m1_lo = np.searchsorted(m1_times, bar_times, side="left")
+        m1_hi = np.searchsorted(m1_times, bar_times + bar_len, side="left")
+
+    def _exit_path(i: int, o: float, h: float, l: float, c: float
+                   ) -> Optional[Tuple[float, ...]]:
+        """Piecewise-monotonic price path for bar i (None = conservative)."""
+        if m1_lo is not None and m1_hi[i] > m1_lo[i]:
+            pts: List[float] = []
+            for j in range(m1_lo[i], m1_hi[i]):
+                pts.extend(_path_points(m1_opens[j], m1_highs[j],
+                                        m1_lows[j], m1_closes[j]))
+            return tuple(pts)
+        if intrabar_mode in ("path", "m1"):
+            return _path_points(o, h, l, c)
+        return None
+
     # -- trade-management (exit/risk) overlay precompute + state -----------
     tm = strategy.trade_mgmt
     tp = tm.params
     tm_directional = mech.type in (ExecutionMechanicType.STANDARD_SLTP,
                                    ExecutionMechanicType.PARTIAL_CLOSE)
     atr_arr = _atr(df, int(tp.get("atr_period", 14))) if tm.uses_atr() else None
+
+    # Adaptive regime features: precompute per-bar regime codes once (same
+    # parameterized classification the generated EA replicates), then derive
+    # the entry gate and/or the per-regime lot multipliers from them.
+    regime_ok = None
+    regime_lot_mult = None
+    use_regime = (getattr(tm, "regime_filter", False)
+                  or getattr(tm, "regime_sizing", False))
+    if use_regime:
+        from factory.regime import allowed_by_mask, classify_regimes_filter
+        codes = classify_regimes_filter(
+            df,
+            adx_period=int(tp.get("regime_adx_period", 14)),
+            atr_period=int(tp.get("regime_atr_period", 14)),
+            adx_min=tp.get("regime_adx_min", 25.0),
+            atr_mult=tp.get("regime_atr_mult", 1.25),
+        )
+        if getattr(tm, "regime_filter", False):
+            regime_ok = allowed_by_mask(
+                codes, int(tp.get("regime_allow_mask", 15)))
+        if getattr(tm, "regime_sizing", False):
+            mults = np.array([
+                tp.get("regime_size_quiet_range", 1.0),
+                tp.get("regime_size_quiet_trend", 1.0),
+                tp.get("regime_size_vol_range", 1.0),
+                tp.get("regime_size_vol_trend", 1.0),
+            ], dtype=float)
+            regime_lot_mult = mults[codes]
     day_idx = times // 86400                      # integer trading-day index
     hour_of_day = ((times % 86400) // 3600).astype("int64")
     cur_day = -1
@@ -781,15 +956,21 @@ def run_simulation(df: pd.DataFrame, strategy: StrategyDefinition,
             trades_today = 0
             day_start_balance = book.balance
 
-        # -- 1. intrabar SL/TP exits (conservative: SL checked before TP) --
+        # -- 1. intrabar SL/TP exits ----------------------------------------
+        # Exit ordering follows the bar's assumed (or M1-replayed) price
+        # path; "conservative" mode keeps the legacy SL-before-TP rule.
+        path = _exit_path(i, o, h, l, c) if book.positions else None
         for pos in list(book.positions):
-            hit_price = None
-            if pos.sl > 0 and ((pos.direction > 0 and l <= pos.sl)
-                               or (pos.direction < 0 and h >= pos.sl)):
-                hit_price = pos.sl
-            elif pos.tp > 0 and ((pos.direction > 0 and h >= pos.tp)
-                                 or (pos.direction < 0 and l <= pos.tp)):
-                hit_price = pos.tp
+            if path is not None:
+                hit_price = _first_touch_exit(pos, path)
+            else:
+                hit_price = None
+                if pos.sl > 0 and ((pos.direction > 0 and l <= pos.sl)
+                                   or (pos.direction < 0 and h >= pos.sl)):
+                    hit_price = pos.sl
+                elif pos.tp > 0 and ((pos.direction > 0 and h >= pos.tp)
+                                     or (pos.direction < 0 and l <= pos.tp)):
+                    hit_price = pos.tp
             if hit_price is not None:
                 was_primary = not pos.is_hedge
                 book.close(pos, hit_price, t)
@@ -811,7 +992,11 @@ def run_simulation(df: pd.DataFrame, strategy: StrategyDefinition,
                         and len(primaries) < int(mp["max_levels"])):
                     lots = base_lots * (mp["lot_multiplier"] ** len(primaries))
                     if book.total_lots() + lots <= max_open_lots:
-                        book.open(d, round(lots, 2), c, t, grid_level=len(primaries))
+                        g_spread, g_slip = _bar_costs(i)
+                        book.open(d, round(lots, 2), c, t,
+                                  grid_level=len(primaries),
+                                  spread_points=g_spread,
+                                  slippage_points=g_slip)
                 # basket TP off volume-weighted average price
                 primaries = [p for p in book.positions if not p.is_hedge]
                 if primaries:
@@ -829,8 +1014,10 @@ def run_simulation(df: pd.DataFrame, strategy: StrategyDefinition,
                 p0 = primaries[0]
                 adverse_pts = -p0.direction * (c - p0.entry_price) / spec.point
                 if adverse_pts >= mp["hedge_trigger_points"]:
+                    h_spread, h_slip = _bar_costs(i)
                     book.open(-p0.direction, round(p0.lots * mp["hedge_ratio"], 2),
-                              c, t, is_hedge=True)
+                              c, t, is_hedge=True,
+                              spread_points=h_spread, slippage_points=h_slip)
             elif primaries and hedges and book.floating_pnl(c) >= 0:
                 book.close_all(c, t)      # basket recovered to breakeven
 
@@ -884,14 +1071,27 @@ def run_simulation(df: pd.DataFrame, strategy: StrategyDefinition,
                 tm, tp, hour_of_day[i], trades_today, day_start_balance,
                 book.equity(c), i, cooldown_until):
             direction = 1 if long_sig[i] else (-1 if short_sig[i] else 0)
+            if direction != 0 and regime_ok is not None and not regime_ok[i]:
+                direction = 0            # hostile market regime: stand aside
+            e_spread, e_slip = _bar_costs(i)
+            # max-spread entry gate (mirrors the rendered EA's spread check):
+            # skip signals landing on bars where the session-widened spread
+            # exceeds the strategy's configured ceiling.
+            if (direction != 0 and e_spread is not None
+                    and max_spread > 0 and e_spread > max_spread):
+                direction = 0
             if direction != 0:
                 atr_price = (float(atr_arr[i]) if atr_arr is not None
                              and not np.isnan(atr_arr[i]) else 0.0)
                 sl_pts, tp_pts, lots = _entry_sizing(
                     tm, tp, mech.type, mp, tm_directional, atr_price, spec,
                     base_lots, book.equity(c), max_open_lots)
+                if regime_lot_mult is not None:
+                    lots = max(0.01, round(lots * regime_lot_mult[i], 2))
                 if book.open(direction, lots, c, t,
-                             sl_points=sl_pts, tp_points=tp_pts) is not None:
+                             sl_points=sl_pts, tp_points=tp_pts,
+                             spread_points=e_spread,
+                             slippage_points=e_slip) is not None:
                     trades_today += 1
 
         # -- 4. mark to market ----------------------------------------------

@@ -55,6 +55,10 @@ class MonteCarloConfig:
     n_resamples: int = settings.MC_RESAMPLES
     min_profitable: float = settings.MC_MIN_PROFITABLE
     max_dd_p95: float = settings.MC_MAX_DD_P95
+    # price-path block bootstrap (counterfactual histories)
+    path_runs: int = settings.MC_PATH_RUNS
+    path_block_bars: int = settings.MC_PATH_BLOCK_BARS
+    min_path_profitable: float = settings.MC_MIN_PATH_PROFITABLE
     seed: Optional[int] = None
 
 
@@ -76,6 +80,63 @@ def perturb_flat_params(strategy: StrategyDefinition, rng: random.Random,
             continue
         steps = rng.randint(1, max(1, max_steps)) * rng.choice((-1, 1))
         out[key] = r.clamp(value + steps * r.step)
+    return out
+
+
+def block_bootstrap_ohlc(df: pd.DataFrame, rng: random.Random,
+                         block_bars: int = 96) -> pd.DataFrame:
+    """Resample the price path in contiguous blocks of bars.
+
+    Log-returns (bar-relative OHLC shapes included) are drawn in blocks of
+    ``block_bars`` consecutive bars with replacement, then re-chained from the
+    original starting price. Short-range autocorrelation, volatility
+    clustering and intrabar structure survive inside each block, while the
+    specific realized *sequence* of the market is destroyed — a strategy
+    whose edge depends on one particular path (rather than the statistical
+    character of the market) falls apart on these counterfactual histories.
+
+    Timestamps are kept from the original frame so session filters and the
+    dynamic cost model keep working.
+    """
+    n = len(df)
+    if n < block_bars * 2:
+        return df
+    open_ = df["open"].to_numpy(dtype=float)
+    high = df["high"].to_numpy(dtype=float)
+    low = df["low"].to_numpy(dtype=float)
+    close = df["close"].to_numpy(dtype=float)
+    volume = df["volume"].to_numpy(dtype=float)
+
+    prev_close = np.roll(close, 1)
+    prev_close[0] = close[0]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        r_close = np.log(np.maximum(close, 1e-12) / np.maximum(prev_close, 1e-12))
+    # bar shape relative to its own close: gap + extremes
+    r_open = np.log(np.maximum(open_, 1e-12) / np.maximum(prev_close, 1e-12))
+    r_high = np.log(np.maximum(high, 1e-12) / np.maximum(close, 1e-12))
+    r_low = np.log(np.maximum(low, 1e-12) / np.maximum(close, 1e-12))
+
+    n_blocks = int(np.ceil(n / block_bars))
+    starts = [rng.randint(0, n - block_bars) for _ in range(n_blocks)]
+    order = np.concatenate([np.arange(s, s + block_bars) for s in starts])[:n]
+
+    new_close = close[0] * np.exp(np.cumsum(r_close[order]))
+    prev_new = np.roll(new_close, 1)
+    prev_new[0] = close[0]
+    new_open = prev_new * np.exp(r_open[order])
+    new_high = new_close * np.exp(r_high[order])
+    new_low = new_close * np.exp(r_low[order])
+    # enforce OHLC sanity after re-chaining
+    new_high = np.maximum.reduce([new_high, new_open, new_close])
+    new_low = np.minimum.reduce([new_low, new_open, new_close])
+
+    out = df.copy()
+    out["open"] = new_open
+    out["high"] = new_high
+    out["low"] = new_low
+    out["close"] = new_close
+    out["volume"] = volume[order]
+    out.attrs = dict(getattr(df, "attrs", {}))
     return out
 
 
@@ -176,6 +237,19 @@ def run_montecarlo(strategy: StrategyDefinition, df: pd.DataFrame,
         if not band_ts:
             band_ts = m.equity_ts
 
+    # -- price-path block bootstrap: counterfactual histories ---------------
+    path_profits: List[float] = []
+    for _ in range(max(0, cfg.path_runs)):
+        if cancel_check is not None and cancel_check():
+            raise JobCancelled()
+        bdf = block_bootstrap_ohlc(df, rng, cfg.path_block_bars)
+        try:
+            pm, _ = run_simulation(bdf, strategy, spec, deposit,
+                                   cancel_check=cancel_check)
+        except Exception:
+            continue
+        path_profits.append(pm.net_profit)
+
     reasons: List[str] = []
     if not runs:
         return MonteCarloResult(
@@ -223,6 +297,15 @@ def run_montecarlo(strategy: StrategyDefinition, df: pd.DataFrame,
             f"trade-order-resampled 95% drawdown {resample_dd_p95:.1f}%"
             f" > limit {cfg.max_dd_p95}%")
 
+    path_pct_profitable = 0.0
+    if path_profits:
+        path_pct_profitable = float(
+            (np.asarray(path_profits) > 0).mean())
+        if path_pct_profitable < cfg.min_path_profitable:
+            reasons.append(
+                f"only {path_pct_profitable:.0%} of block-bootstrap paths"
+                f" profitable (gate {cfg.min_path_profitable:.0%})")
+
     score = robustness_score(pct_profitable, profit_p05, profit_p50,
                              max(dd_p95, resample_dd_p95), cfg.max_dd_p95)
 
@@ -234,6 +317,8 @@ def run_montecarlo(strategy: StrategyDefinition, df: pd.DataFrame,
         profit_p95=round(profit_p95, 2),
         dd_p95=round(dd_p95, 3),
         resample_dd_p95=round(resample_dd_p95, 3),
+        path_runs=len(path_profits),
+        path_pct_profitable=round(path_pct_profitable, 4),
         robustness_score=score,
         band_ts=band_ts, band_p05=band_p05, band_p50=band_p50,
         band_p95=band_p95,

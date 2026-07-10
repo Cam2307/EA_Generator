@@ -20,6 +20,7 @@ import threading
 import time
 import uuid
 import xml.etree.ElementTree as ET
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -292,10 +293,21 @@ class MT5Runner(BacktestEngine):
     name = "mt5"
 
     def __init__(self, paths: Optional[MT5Paths] = None,
-                 leverage: Optional[int] = None):
+                 leverage: Optional[int] = None,
+                 portable: bool = False, exclusive: bool = True):
         self._paths = paths
         # User-chosen account leverage for the tester .ini (None -> MT5 default).
         self.leverage = leverage
+        # Portable mode launches terminal/metaeditor with /portable so the
+        # instance uses its own directory as the data dir — the basis of the
+        # multi-instance pool (jobs/mt5_pool.py).
+        self.portable = portable
+        # exclusive=True keeps the legacy safety net for a single shared
+        # install: one tester at a time process-wide, and refuse to run while
+        # an interactive terminal owns the data directory. Pool-managed
+        # portable instances don't share a data dir, so leasing already
+        # guarantees safety and these global guards are skipped.
+        self.exclusive = exclusive
 
     @property
     def paths(self) -> MT5Paths:
@@ -315,6 +327,8 @@ class MT5Runner(BacktestEngine):
 
         log_path = dest.with_suffix(".log")
         cmd = [str(paths.metaeditor_exe), f"/compile:{dest}", f"/log:{log_path}"]
+        if self.portable:
+            cmd.append("/portable")
         try:
             subprocess.run(
                 cmd,
@@ -383,16 +397,22 @@ class MT5Runner(BacktestEngine):
         # terminal is already open interactively, the new instance exits
         # immediately without running the tester (and without any error), so
         # fail fast with a clear, job-record-friendly explanation instead.
-        if _terminal_running():
+        # Pool-managed portable instances own their data dir, so the check
+        # (which sees ANY terminal64.exe, including other pool members) and
+        # the process-wide lock are skipped for them.
+        if self.exclusive and _terminal_running():
             raise MT5RunnerError(
                 "MetaTrader 5 terminal is already running interactively. "
                 "Close the MT5 application and retry: headless tester runs "
                 "need exclusive use of the terminal data directory.")
 
         cmd = [str(paths.terminal_exe), f"/config:{ini_path}"]
+        if self.portable:
+            cmd.append("/portable")
         cancel_check = getattr(self, "_cancel_check", None)
         returncode = 0
-        with _MT5_LOCK:                     # strictly sequential MT5 execution
+        lane = _MT5_LOCK if self.exclusive else nullcontext()
+        with lane:                          # sequential per shared install
             proc = subprocess.Popen(  # noqa: S603
                 cmd,
                 stdout=subprocess.DEVNULL,

@@ -52,8 +52,19 @@ factory/generator.py        Logic Matrix: random sampling + genetic crossover/mu
 factory/backtest/base.py    BacktestEngine ABC
 factory/backtest/mt5_runner.py   Headless MT5: compile via metaeditor64, tester .ini, XML reports
 factory/backtest/simulator.py    Event-driven bar-by-bar fallback engine (stateful PositionBook)
+factory/backtest/costs.py        Session-aware dynamic spread/slippage model
 factory/backtest/validation.py   70/30 IS/OOS, WFO, acceptance gates, MC gate
-factory/backtest/montecarlo.py   Monte Carlo robustness testing
+factory/backtest/statistics.py   Deflated Sharpe Ratio + selection-bias stats
+factory/backtest/montecarlo.py   Monte Carlo robustness + price-path block bootstrap
+factory/backtest/reconcile.py    Simulator vs MT5 bias quantification
+factory/regime.py            Market-regime classification + per-regime breakdown
+factory/pareto.py            NSGA-II multi-objective primitives for the GA
+factory/correlation.py       Return-stream correlation (duplicate-edge curation)
+factory/manifest.py          Reproducibility manifests (seed, data hash, versions)
+factory/reoptimize.py        Online re-optimization of promoted strategies
+factory/portfolio.py         HRP portfolio weights + combined-portfolio metrics
+app/components/theme.py      Shared design system (hero, KPI strip, chips)
+app/components/portfolio_panel.py  Gallery "Portfolio" view (HRP, heatmap)
 factory/discovery_config.py   Shared discovery settings + job payload builder
 factory/agent_alerts.py       Hourly progress digests + quality alerts for the agent
 docs/ea_studio_reference.md      EA Studio benchmark notes
@@ -61,6 +72,7 @@ docs/mql5_validator_checklist.md MQL5 Market validator checklist
 factory/mql5/renderer.py    Validator-proof .mq5 assembly from templates/
 factory/assets/             .set writer, marketplace .md writer, package exporter
 jobs/worker.py              Singleton JobQueue, single-slot MT5 lane, SQLite-persisted progress
+jobs/mt5_pool.py            Multi-instance MT5 pool (portable installs, parallel testers)
 jobs/orchestrator.py        Detached discovery agent (batch + continuous sweep modes)
 jobs/sweep.py               Symbol × timeframe sweep planner
 scripts/discovery_agent_service.py  Orchestrator entry point (spawned by the dashboard)
@@ -75,7 +87,20 @@ data/ reports/ output/      Runtime artifacts (git-ignored)
   stateful `PositionBook` that models sequential DCA/grid fills, hedge
   layers, partial closes, floating drawdown, margin usage, and spread +
   slippage per fill. Vectorization is used only to precompute indicator and
-  signal arrays. **It is a pre-filter, not the truth**: every surviving
+  signal arrays. Execution realism (see `config/settings.py`):
+  - **Session-aware dynamic costs** (`SIMULATOR_DYNAMIC_COSTS`): spread
+    widens by UTC hour/weekday (rollover spike, Asian session, weekend
+    gaps) and slippage scales with realized volatility; the configured
+    spread/slippage are the *typical London-session* base costs. Entries
+    are skipped when the session-widened spread exceeds the strategy's
+    `max_spread_points`.
+  - **Intrabar exit resolution** (`SIMULATOR_INTRABAR_MODE`): same-bar
+    SL/TP ambiguity is resolved along the bar's OHLC path (bullish bars
+    walk open→low→high→close) or, in `"m1"` mode, by replaying real M1
+    bars inside each strategy bar (auto-falls back to the path heuristic
+    when M1 data is unavailable or synthetic). Gap-throughs still exit.
+
+  **It is a pre-filter, not the truth**: every surviving
   strategy must still pass a real MT5 Strategy Tester run before you ship it.
 - **MT5 runner (source of truth).** Auto-detects the terminal via the
   `MetaTrader5` package, compiles rendered EAs with `metaeditor64.exe`,
@@ -87,6 +112,17 @@ data/ reports/ output/      Runtime artifacts (git-ignored)
   running interactive terminal owns the data directory, and a second
   instance exits silently without running the tester. The runner detects
   this and reports it as a clear job error.
+- **MT5 pool (optional, parallel).** Configure `MT5_INSTANCE_PATHS` in
+  `config/settings.py` with the `terminal64.exe` paths of N *portable-mode*
+  installs (each owns its own data directory) and MT5 discovery validates
+  candidates **in parallel across the pool** — each candidate leases one
+  instance exclusively for its whole validation. Provisioning steps are in
+  `jobs/mt5_pool.py`. With no instances configured, the legacy single lane
+  applies.
+- **Reconciliation harness.** `python scripts/reconcile_engines.py` runs the
+  same strategies through both engines and reports per-metric deltas plus
+  the simulator's aggregate optimism/pessimism bias — the number that tells
+  you how much to trust (and how to calibrate) the pre-filter. Requires MT5.
 - If neither MT5 nor cached data is available, the simulator falls back to a
   deterministic **synthetic random-walk series** so the pipeline can be
   developed and demoed offline (clearly not market data — treat results as
@@ -114,11 +150,25 @@ their settings — e.g. RSI period 14, oversold level 25.
 **Trade-management overlay (optional).** On top of the mechanic, each strategy
 may also get adaptive or fixed stop loss, risk-reward take profit, trailing
 stop (fixed / ATR / chandelier), breakeven triggers, session filters, daily
-loss limits, and related controls.
+loss limits, and related controls — plus an **adaptive regime filter**: the
+strategy classifies every bar into quiet/volatile × range/trend (ADX +
+ATR-vs-baseline proxies) and only enters in the regimes enabled by an
+optimizable bitmask. The mask *and* the classification thresholds are tuned
+by the optimizer, exported in the `.set`, and the generated EA computes the
+identical classification on-chart (`TM_RegimeAllowed()` — same formula as
+`factory/regime.py::classify_regimes_filter`), so a validated regime edge
+survives export unchanged. A companion **regime sizing** feature scales the
+entry lot size by an optimizable per-regime multiplier
+(`Inp_X_regime_size_*`), applied identically in the simulator and the EA.
 
 New strategies are built randomly, then the genetic loop keeps promising
 candidates and breeds better ones — mutating parameter values and combining
-entry filters from two parents across generations.
+entry filters from two parents across generations. Parent selection is
+**multi-objective (NSGA-II)** by default (`PARETO_EVOLUTION`): candidates are
+ranked by Pareto dominance over *(net profit, max drawdown, equity R²,
+trade count)* with crowding-distance diversity, so discovery explores the
+whole profit/risk/stability frontier instead of collapsing onto one scalar
+compromise. Set `PARETO_EVOLUTION = False` for the legacy scalar tournament.
 
 ### 2. What gets optimized (including SL distance)
 
@@ -178,10 +228,44 @@ rolling walk-forward windows. Pass/fail is driven by user-configurable
 **acceptance criteria** (WFE, OOS drawdown, min trades, profit factor,
 Sharpe, equity R-squared, max consecutive losses). Survivors are then
 stress-tested by a **Monte Carlo** module (randomized spread/slippage,
-parameter perturbation, entry jitter, trade-order resampling) and must pass
-its robustness gate (default: ≥ 80% of MC runs profitable, 95%-worst-case DD
-within limit). IS→OOS **degradation %** and optimizer **stability ratio** are
-reported on every strategy card.
+parameter perturbation, entry jitter, trade-order resampling, and
+**price-path block bootstrap** — the strategy is re-run on counterfactual
+histories rebuilt from resampled blocks of real bar returns) and must pass
+its robustness gates (default: ≥ 80% of MC runs profitable, 95%-worst-case DD
+within limit, ≥ 60% of bootstrap paths profitable). IS→OOS **degradation %**
+and optimizer **stability ratio** are reported on every strategy card.
+
+Additional honesty statistics on every validation:
+
+- **Deflated Sharpe Ratio (DSR)** — the probability the OOS Sharpe beats the
+  *expected best-of-N zero-skill* Sharpe, where N is how many candidates the
+  run had tried. Near 1.0 = likely a real edge; ≤ ~0.5 = plausibly pure
+  selection luck. Shown on strategy cards and available as a sort order.
+- **Per-regime breakdown** — every OOS trade is attributed to one of four
+  market regimes (quiet/volatile × range/trend, from ADX + ATR-percentile
+  proxies) so "profitable overall" decomposes into per-regime PF/net/win
+  rate. The optional `max_regime_loss_pct` acceptance gate rejects
+  strategies whose worst regime loses more than a set % of the deposit.
+- **Return-stream correlation** — promotion scoring penalizes candidates
+  whose daily OOS returns are > 0.6 correlated with an already-promoted
+  strategy (the same edge under a different name).
+- **Run manifests** — every discovery run persists its concrete seed, full
+  payload, a SHA-256 fingerprint of the exact bar data, the realism settings
+  in force, and library versions, so any gallery strategy is re-derivable.
+
+## Maintenance & portfolio
+
+- **Online re-optimization** — `python scripts/reoptimize_promoted.py`
+  (schedule it weekly/monthly) re-runs the IS optimizer for every promoted
+  strategy on the trailing window. When the fitness plateau has genuinely
+  shifted (params changed AND the incumbent trails the fresh optimum by
+  >10%), it writes an updated `.set` into `output/reoptimized/` and flags
+  the strategy — the factory maintains its fleet instead of only growing it.
+- **HRP portfolio** — the Gallery's **Portfolio** view computes Hierarchical
+  Risk Parity weights over the selected strategies' OOS daily-return streams
+  (with gap-aware bisection so near-duplicate edges share one risk bucket),
+  plus a correlation heatmap, combined equity curve, and diversification
+  ratio. HRP balances risk; it cannot create edge.
 
 See `config/settings.py` and `docs/ea_studio_reference.md`.
 

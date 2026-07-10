@@ -9,7 +9,7 @@ bool g_hedge_active = false;
 //@SECTION FUNCTIONS
 void OpenEntry(const ENUM_ORDER_TYPE type)
   {
-   const double lots = NormalizeLots(InpLots);
+   const double lots = NormalizeLots(InpLots * TM_RegimeLotMult());
    const double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    const double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double sl = 0.0, tp = 0.0;

@@ -17,3 +17,6 @@ output/*
 # Logs / temp
 *.log
 *.tmp
+
+# Local agent/assistant config
+.claude/settings.local.json

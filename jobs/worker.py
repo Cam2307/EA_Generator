@@ -17,6 +17,7 @@ import random
 import threading
 import time
 import traceback
+from contextlib import contextmanager
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -30,7 +31,10 @@ from factory.backtest.simulator import SimulatorEngine, SymbolSpec
 from factory.backtest.validation import (
     default_criteria, quick_screen, screen_fitness, validate_strategy,
 )
-from factory.generator import GenerationSettings, evolve, random_strategy
+from factory.generator import (
+    GenerationSettings, evolve, evolve_pareto, random_strategy,
+)
+from factory.pareto import objectives_from_metrics
 from factory.models import (
     AcceptanceCriteria, BacktestMetrics, ExecutionMechanicType, Job,
     JobCancelled, JobStatus, StrategyDefinition, ValidationReport,
@@ -203,10 +207,12 @@ def _evaluate_candidate(task: Dict) -> Dict:
     engine = SimulatorEngine(spec_overrides=spec_overrides)
     engine._cancel_check = cancel_check
     result = {"strategy": strat, "fitness": 0.0, "promising": False,
-              "passed": False, "error": None, "cancelled": False}
+              "passed": False, "error": None, "cancelled": False,
+              "objectives": None}
     try:
         promising, m = quick_screen(engine, strat, start, end, deposit, criteria)
         result["fitness"] = screen_fitness(m)
+        result["objectives"] = objectives_from_metrics(m)
         if not promising:
             return result
         result["promising"] = True
@@ -216,7 +222,8 @@ def _evaluate_candidate(task: Dict) -> Dict:
             mc_config=task["mc_config"], wfo_train_months=task["wfo_train"],
             wfo_test_months=task["wfo_test"], wfo_windows=task["wfo_n"],
             data_source=task["data_source"], cancel_check=cancel_check,
-            spec_overrides=spec_overrides)
+            spec_overrides=spec_overrides,
+            n_trials=int(task.get("n_trials", 1)))
         result["passed"] = report.passed
         storage.save_complete(
             strat,
@@ -263,6 +270,13 @@ class JobQueue:
         self._executor = ThreadPoolExecutor(max_workers=2,
                                             thread_name_prefix="eafactory")
         self._mt5_lane = threading.Lock()   # max one concurrent MT5 terminal
+        # Optional multi-instance MT5 pool (portable installs). None keeps
+        # the legacy single-lane behavior above.
+        try:
+            from jobs.mt5_pool import pool_from_settings
+            self._mt5_pool = pool_from_settings()
+        except Exception:
+            self._mt5_pool = None
         self._submitted: Dict[str, bool] = {}
         self._submit_lock = threading.Lock()
         self._reconcile_orphaned_jobs()
@@ -351,6 +365,27 @@ class JobQueue:
     # ------------------------------------------------------------------
     # Discovery pipeline
     # ------------------------------------------------------------------
+    @contextmanager
+    def _mt5_engine_lease(self, default_engine, spec_overrides: Dict[str, float],
+                          cancel_check):
+        """Yield an engine for ONE MT5 validation run.
+
+        With a pool configured, lease a portable instance exclusively and
+        bind a fresh non-exclusive runner to it (several leases can then run
+        testers concurrently). Without a pool, fall back to the shared
+        engine under the legacy single lane.
+        """
+        if self._mt5_pool is not None:
+            lev = spec_overrides.get("leverage") if spec_overrides else None
+            with self._mt5_pool.lease() as instance:
+                runner = self._mt5_pool.runner_for(
+                    instance, leverage=int(lev) if lev is not None else None)
+                runner._cancel_check = cancel_check
+                yield runner
+        else:
+            with self._mt5_lane:
+                yield default_engine
+
     def _run_discovery_safe(self, job_id: str) -> None:
         try:
             self._run_discovery(job_id)
@@ -395,7 +430,13 @@ class JobQueue:
         engine_name = payload.get("engine", settings.DEFAULT_ENGINE)
         deposit = float(payload.get("deposit", settings.DEFAULT_DEPOSIT))
         spec_overrides = _spec_overrides_from_payload(payload)
+        # Reproducibility: a run without an explicit seed gets a concrete one
+        # drawn here and recorded in the manifest, so *every* run — not just
+        # deliberately seeded ones — can be exactly re-derived later.
         seed = payload.get("seed")
+        if seed is None:
+            seed = random.SystemRandom().randint(0, 2**31)
+            payload["seed"] = seed
 
         # generation size + loop budget (thousands of candidates supported)
         gen_size = int(payload.get("batch_size", 100))
@@ -442,6 +483,15 @@ class JobQueue:
         data_source = str(payload.get("data_source") or full_ohlc.attrs.get("source", "unknown"))
         ohlc_blob = pickle.dumps((symbol, timeframe, full_ohlc))
 
+        # Persist the reproducibility manifest before any candidate runs, so
+        # even a crashed/cancelled run documents exactly what it saw.
+        try:
+            from factory.manifest import build_manifest
+            storage.save_run_manifest(build_manifest(job_id, payload, seed,
+                                                     full_ohlc))
+        except Exception:
+            pass  # manifests are diagnostics — never block a run on them
+
         rng = random.Random(seed)
         engine = self._make_engine(engine_name)
         _apply_spec_overrides(engine, spec_overrides)
@@ -455,7 +505,7 @@ class JobQueue:
         screened_in = 0       # candidates promising enough for full validation
         survivors = 0         # strategies passing all gates
         errors = 0
-        scored: list = []     # (strategy, screen_fitness) for genetic evolution
+        scored: list = []     # (strategy, screen_fitness, objectives) triples
         generation = 0
         persist_state = {"ts": 0.0, "tested": 0}
 
@@ -497,8 +547,20 @@ class JobQueue:
                                         allowed_tm_features=allowed_tm_features,
                                         generation_settings=generation_settings)
                         for _ in range(this_gen)]
-            top = sorted(scored, key=lambda t: t[1], reverse=True)[:50]
-            pop = evolve(top, this_gen, rng)
+            if getattr(settings, "PARETO_EVOLUTION", True):
+                # NSGA-II over the most recent candidates with objective
+                # vectors; keeps the population spread along the whole
+                # profit/risk/stability front instead of one scalar peak.
+                recent = [(s, obj) for s, _f, obj in scored[-500:]
+                          if obj is not None]
+                if len(recent) >= 2:
+                    pop = evolve_pareto(recent, this_gen, rng)
+                else:
+                    top = sorted(scored, key=lambda t: t[1], reverse=True)[:50]
+                    pop = evolve([(s, f) for s, f, _o in top], this_gen, rng)
+            else:
+                top = sorted(scored, key=lambda t: t[1], reverse=True)[:50]
+                pop = evolve([(s, f) for s, f, _o in top], this_gen, rng)
             n_fresh = max(1, this_gen // 3)      # fresh blood vs. convergence
             pop[:n_fresh] = [random_strategy(symbol, timeframe, rng,
                                              allowed_mechanics=allowed_mechanics,
@@ -529,6 +591,7 @@ class JobQueue:
                 "mc_config": mc_config, "wfo_train": wfo_train,
                 "wfo_test": wfo_test, "wfo_n": wfo_n, "data_source": data_source,
                 "spec_overrides": spec_overrides, "seed": rng.randint(0, 2**31),
+                "n_trials": tested + 1,
                 "db_path": str(self.storage.db_path), "job_id": job_id,
                 "sweep_symbol": payload.get("symbol"),
                 "sweep_timeframe": payload.get("timeframe"),
@@ -544,6 +607,92 @@ class JobQueue:
                 remaining = max_candidates - tested
                 population = _build_population(min(gen_size, remaining))
 
+                if (pool is None and engine_name == "mt5"
+                        and self._mt5_pool is not None
+                        and self._mt5_pool.size > 1):
+                    # -- MT5 pool: validate the generation in parallel -------
+                    # Each task leases one portable instance for its whole
+                    # validation (IS opt + OOS + WFO), so at most pool.size
+                    # testers run concurrently and no instance is shared.
+                    def _candidate_meta(strat, report) -> Dict:
+                        return {
+                            "sweep_symbol": payload.get("symbol"),
+                            "sweep_timeframe": payload.get("timeframe"),
+                            "strictness_profile": payload.get(
+                                "strictness_profile", "normal"),
+                            "seed": payload.get("seed"),
+                            "parameter_snapshot": report.best_params,
+                            "parent_id": (strat.lineage.parents[0]
+                                          if strat.lineage.parents else None),
+                            "generation": strat.lineage.generation,
+                        }
+
+                    def _mt5_one(strat, seed_val: int, trial_no: int):
+                        try:
+                            with self._mt5_engine_lease(
+                                    engine, spec_overrides,
+                                    cancel_check) as m5:
+                                rep = validate_strategy(
+                                    m5, strat, start, end, deposit=deposit,
+                                    seed=seed_val, criteria=criteria,
+                                    run_montecarlo=run_mc, mc_config=mc_config,
+                                    wfo_train_months=wfo_train,
+                                    wfo_test_months=wfo_test,
+                                    wfo_windows=wfo_n,
+                                    data_source=data_source,
+                                    cancel_check=cancel_check,
+                                    spec_overrides=spec_overrides,
+                                    n_trials=trial_no)
+                            return "ok", rep, None
+                        except JobCancelled:
+                            return "cancelled", None, None
+                        except Exception as exc:  # noqa: BLE001
+                            return ("error",
+                                    _aborted_validation_report(strat, "mt5", exc),
+                                    f"{type(exc).__name__}: {exc}")
+
+                    was_cancelled = False
+                    tex = ThreadPoolExecutor(
+                        max_workers=self._mt5_pool.size,
+                        thread_name_prefix="mt5pool")
+                    futures = {
+                        tex.submit(_mt5_one, s, rng.randint(0, 2**31),
+                                   tested + k + 1): s
+                        for k, s in enumerate(population)}
+                    try:
+                        for fut in as_completed(futures):
+                            strat = futures[fut]
+                            status, report, err = fut.result()
+                            if status == "cancelled":
+                                was_cancelled = True
+                                continue
+                            tested += 1
+                            screened_in += 1
+                            if err:
+                                errors += 1
+                                storage.set_job_status(
+                                    job_id, JobStatus.RUNNING, error=err)
+                            _persist_complete(storage, strat, report,
+                                              job_id=job_id,
+                                              metadata=_candidate_meta(strat, report))
+                            scored.append((strat,
+                                           screen_fitness(report.oos_metrics),
+                                           objectives_from_metrics(report.oos_metrics)))
+                            if report.passed:
+                                survivors += 1
+                            _persist_progress()
+                            if survivors >= target_survivors or _cancelled_now():
+                                for f in futures:
+                                    f.cancel()
+                    finally:
+                        tex.shutdown(wait=True, cancel_futures=True)
+
+                    if was_cancelled or _cancelled_now():
+                        _finish_cancelled()
+                        return
+                    generation += 1
+                    continue
+
                 if pool is None:
                     # -- Sequential lane: MT5 (always) and non-simulator stubs --
                     for strat in population:
@@ -557,16 +706,19 @@ class JobQueue:
                         engine_label = getattr(engine, "name", engine_name)
                         if engine_name == "mt5":
                             try:
-                                with self._mt5_lane:
+                                with self._mt5_engine_lease(
+                                        engine, spec_overrides,
+                                        cancel_check) as mt5_engine:
                                     report = validate_strategy(
-                                        engine, strat, start, end, deposit=deposit,
+                                        mt5_engine, strat, start, end, deposit=deposit,
                                         seed=rng.randint(0, 2**31), criteria=criteria,
                                         run_montecarlo=run_mc, mc_config=mc_config,
                                         wfo_train_months=wfo_train,
                                         wfo_test_months=wfo_test, wfo_windows=wfo_n,
                                         data_source=data_source,
                                         cancel_check=cancel_check,
-                                        spec_overrides=spec_overrides)
+                                        spec_overrides=spec_overrides,
+                                        n_trials=tested)
                             except JobCancelled:
                                 _finish_cancelled()
                                 return
@@ -600,7 +752,8 @@ class JobQueue:
                                                       "parent_id": (strat.lineage.parents[0] if strat.lineage.parents else None),
                                                       "generation": strat.lineage.generation,
                                                   })
-                            scored.append((strat, screen_fitness(report.oos_metrics)))
+                            scored.append((strat, screen_fitness(report.oos_metrics),
+                                           objectives_from_metrics(report.oos_metrics)))
                             if report.passed:
                                 survivors += 1
                         else:
@@ -619,7 +772,8 @@ class JobQueue:
                                     error=f"{type(exc).__name__}: {exc}")
                                 continue
 
-                            scored.append((strat, screen_fitness(m)))
+                            scored.append((strat, screen_fitness(m),
+                                           objectives_from_metrics(m)))
                             if not promising:
                                 continue
                             screened_in += 1
@@ -632,7 +786,8 @@ class JobQueue:
                                     wfo_test_months=wfo_test, wfo_windows=wfo_n,
                                     data_source=data_source,
                                     cancel_check=cancel_check,
-                                    spec_overrides=spec_overrides)
+                                    spec_overrides=spec_overrides,
+                                    n_trials=tested)
                             except JobCancelled:
                                 _finish_cancelled()
                                 return
@@ -685,7 +840,8 @@ class JobQueue:
                                     error=f"pool: {type(exc).__name__}: {exc}")
                                 continue
                             tested += 1
-                            scored.append((res["strategy"], res["fitness"]))
+                            scored.append((res["strategy"], res["fitness"],
+                                           res.get("objectives")))
                             if res["promising"]:
                                 screened_in += 1
                                 if res["passed"]:

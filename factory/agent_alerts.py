@@ -50,11 +50,24 @@ def sync_promotion_scores(storage: Storage, *, limit: int = 100) -> int:
     if not reports:
         return 0
     signatures, report_sig = _duplicate_signatures(storage, reports)
+
+    # Return-stream correlation against already-promoted strategies: a
+    # candidate whose daily OOS returns track a promoted strategy is the same
+    # edge under a different name and gets its score shaded accordingly.
+    from factory.correlation import duplicate_penalty_from_corr, max_correlation
+    promoted = [r for r in storage.list_validated(passed_only=True)
+                if r.promotion_state in ("edge_positive",
+                                         "promoted_live_watchlist")]
+
     for report in reports:
         sig = report_sig.get(report.strategy_id, "")
         duplicate_penalty = 0.0
         if sig and signatures.get(sig, 0) > 1:
             duplicate_penalty = min(10.0, (signatures[sig] - 1) * 3.0)
+        if promoted:
+            corr, _corr_id = max_correlation(report, promoted)
+            duplicate_penalty = max(duplicate_penalty,
+                                    duplicate_penalty_from_corr(corr))
         decision = evaluate_promotion(report, duplicate_penalty=duplicate_penalty)
         storage.update_validation_promotion(
             report.strategy_id,

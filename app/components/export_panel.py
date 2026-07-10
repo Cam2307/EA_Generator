@@ -1,8 +1,9 @@
-"""Checkbox selection -> Export Marketplace Package action."""
+"""Marketplace-package builder: selection review -> export action."""
 from __future__ import annotations
 
 import streamlit as st
 
+from app.components import theme
 from config import settings
 from factory.assets.exporter import export_marketplace_package
 from factory.storage import Storage
@@ -22,25 +23,68 @@ def _selected_strategy_ids() -> list[str]:
     return ids
 
 
+_PACKAGE_PARTS = (
+    ("description", ".mq5 source",
+     "Standalone, validator-proof Expert Advisor assembled from hardened "
+     "templates — Market metadata, volume/margin preflight, stops/freeze "
+     "handling, netting/hedging branches."),
+    ("tune", ".set parameters",
+     "Every optimized parameter with its full optimization range in the "
+     "native Value||Start||Step||Stop||Y format — drives an MT5 Strategy "
+     "Tester optimization directly."),
+    ("article", ".md description",
+     "Marketplace-ready listing text generated from the validation report: "
+     "metrics, walk-forward summary, honest limitations."),
+)
+
+
 def render_export_panel(storage: Storage) -> None:
-    st.subheader("Export Marketplace Packages")
-    st.caption(
-        "Each package bundles the standalone validator-proof .mq5, the "
-        "optimized .set file (every parameter with its optimization range), "
-        "and the marketplace .md description into "
-        f"`{settings.OUTPUT_DIR}`.")
+    theme.section(
+        "Export Marketplace Packages",
+        f"Bundles land in `{settings.OUTPUT_DIR}` — one folder per strategy.")
+
+    cols = st.columns(3)
+    for col, (_icon, title, desc) in zip(cols, _PACKAGE_PARTS):
+        with col, st.container(border=True):
+            st.markdown(f"**{title}**")
+            st.caption(desc)
 
     selected_ids = _selected_strategy_ids()
+    st.write("")
 
     if not selected_ids:
-        st.info("Select strategies in the Strategy Gallery tab first.")
+        st.info("Nothing selected yet — tick strategies in the **Strategy "
+                "gallery** tab, then come back here to export them.")
         return
 
-    st.write(f"**{len(selected_ids)}** strategies selected.")
-    if st.button("Export Marketplace Package(s)", type="primary"):
+    # Review list: names + key numbers before the user commits.
+    theme.section("Selected for export", f"{len(selected_ids)} strategies")
+    reports = storage.get_validations(selected_ids)
+    rows = []
+    for sid in selected_ids:
+        strategy = storage.get_strategy(sid)
+        rep = reports.get(sid)
+        if strategy is None:
+            rows.append({"Strategy": sid, "Symbol": "?", "Status": "missing"})
+            continue
+        oos = rep.oos_metrics if rep else None
+        rows.append({
+            "Strategy": strategy.name,
+            "Symbol": f"{strategy.symbol} {strategy.timeframe}",
+            "Mechanic": strategy.mechanic.type.value,
+            "OOS profit": f"{oos.net_profit:,.0f}" if oos else "—",
+            "PF": f"{oos.profit_factor:.2f}" if oos else "—",
+            "WFE": f"{rep.wfe:.2f}" if rep else "—",
+            "State": rep.promotion_state if rep else "—",
+        })
+    st.dataframe(rows, width="stretch", hide_index=True)
+
+    if st.button(f"Export {len(selected_ids)} Marketplace Package(s)",
+                 type="primary", width="stretch"):
         exported = []
         errors = []
-        for sid in selected_ids:
+        progress = st.progress(0.0, text="Exporting…")
+        for i, sid in enumerate(selected_ids):
             strategy = storage.get_strategy(sid)
             report = storage.get_validation(sid)
             if strategy is None or report is None:
@@ -51,7 +95,12 @@ def render_export_panel(storage: Storage) -> None:
                 exported.append(out_dir)
             except Exception as exc:
                 errors.append(f"{strategy.name}: {exc}")
-        for path in exported:
-            st.success(f"Exported `{path}`")
+            progress.progress((i + 1) / len(selected_ids),
+                              text=f"Exporting… {i + 1}/{len(selected_ids)}")
+        progress.empty()
+        if exported:
+            st.success(f"Exported {len(exported)} package(s):")
+            for path in exported:
+                st.code(str(path), language=None)
         for err in errors:
             st.error(err)

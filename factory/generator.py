@@ -160,12 +160,26 @@ TM_PARAM_SPECS: Dict[str, ParamRange] = {
     "max_trades_per_day": ParamRange(min=1, max=10, step=1),
     "daily_loss_pct": ParamRange(min=2, max=10, step=1),
     "cooldown_bars": ParamRange(min=1, max=20, step=1),
+    # adaptive regime gate (see factory/regime.py): which regimes to trade
+    # (bitmask over codes 0..3) and the classification thresholds — all
+    # optimizable, so the search learns which regimes suit the strategy.
+    "regime_allow_mask": ParamRange(min=1, max=14, step=1),
+    "regime_adx_period": ParamRange(min=10, max=24, step=2),
+    "regime_adx_min": ParamRange(min=18, max=32, step=2),
+    "regime_atr_period": ParamRange(min=10, max=20, step=2),
+    "regime_atr_mult": ParamRange(min=1.05, max=1.6, step=0.05),
+    # per-regime entry-lot multipliers (adaptive sizing)
+    "regime_size_quiet_range": ParamRange(min=0.25, max=2.0, step=0.25),
+    "regime_size_quiet_trend": ParamRange(min=0.25, max=2.0, step=0.25),
+    "regime_size_vol_range": ParamRange(min=0.25, max=2.0, step=0.25),
+    "regime_size_vol_trend": ParamRange(min=0.25, max=2.0, step=0.25),
 }
 
 # User-selectable trade-management feature categories (UI multiselect keys).
 TM_FEATURES: Tuple[str, ...] = (
     "adaptive_sl", "risk_reward_tp", "trailing", "breakeven",
-    "risk_sizing", "time_filter", "safeguards", "cooldown",
+    "risk_sizing", "time_filter", "safeguards", "cooldown", "regime_filter",
+    "regime_sizing",
 )
 
 # Mechanics whose per-position exits accept the SL/TP/trailing/breakeven
@@ -216,6 +230,10 @@ def random_trade_mgmt(mech_type: ExecutionMechanicType, rng: random.Random,
         tm.daily_loss_enabled = True
     if "cooldown" in allow and rng.random() < 0.3:
         tm.cooldown_enabled = True
+    if "regime_filter" in allow and rng.random() < 0.35:
+        tm.regime_filter = True
+    if "regime_sizing" in allow and rng.random() < 0.3:
+        tm.regime_sizing = True
 
     # populate optimizable sub-parameters only for the enabled features
     if tm.uses_atr():
@@ -247,6 +265,19 @@ def random_trade_mgmt(mech_type: ExecutionMechanicType, rng: random.Random,
         _add_tm_param(tm, "daily_loss_pct", rng)
     if tm.cooldown_enabled:
         _add_tm_param(tm, "cooldown_bars", rng)
+    if tm.regime_filter or tm.regime_sizing:
+        # classification thresholds are shared by both regime features
+        _add_tm_param(tm, "regime_adx_period", rng)
+        _add_tm_param(tm, "regime_adx_min", rng)
+        _add_tm_param(tm, "regime_atr_period", rng)
+        _add_tm_param(tm, "regime_atr_mult", rng)
+    if tm.regime_filter:
+        _add_tm_param(tm, "regime_allow_mask", rng)
+    if tm.regime_sizing:
+        _add_tm_param(tm, "regime_size_quiet_range", rng)
+        _add_tm_param(tm, "regime_size_quiet_trend", rng)
+        _add_tm_param(tm, "regime_size_vol_range", rng)
+        _add_tm_param(tm, "regime_size_vol_trend", rng)
     return tm
 
 
@@ -290,6 +321,25 @@ def describe_trade_mgmt(tm: TradeManagement) -> List[str]:
         lines.append(f"Daily loss limit: halt trading after -{p.get('daily_loss_pct', 0):.0f}% on the day.")
     if tm.cooldown_enabled:
         lines.append(f"Cooldown: wait {p.get('cooldown_bars', 0):.0f} bars after a loss.")
+    if tm.regime_filter:
+        from factory.regime import REGIME_NAMES
+        mask = int(p.get("regime_allow_mask", 15))
+        allowed = [name for code, name in REGIME_NAMES.items()
+                   if (mask >> code) & 1]
+        lines.append(
+            "Regime filter: trade only in "
+            + (", ".join(allowed) if allowed else "no")
+            + f" conditions (ADX({p.get('regime_adx_period', 14):.0f})"
+            f" > {p.get('regime_adx_min', 25):.0f} = trend;"
+            f" ATR({p.get('regime_atr_period', 14):.0f}) >"
+            f" {p.get('regime_atr_mult', 1.25):.2f}x baseline = volatile).")
+    if tm.regime_sizing:
+        lines.append(
+            "Regime sizing: entry lots x"
+            f" {p.get('regime_size_quiet_range', 1):.2f} (quiet range),"
+            f" x{p.get('regime_size_quiet_trend', 1):.2f} (quiet trend),"
+            f" x{p.get('regime_size_vol_range', 1):.2f} (volatile range),"
+            f" x{p.get('regime_size_vol_trend', 1):.2f} (volatile trend).")
     return lines
 
 
@@ -781,6 +831,45 @@ def crossover(a: StrategyDefinition, b: StrategyDefinition,
     child.magic_number = _MAGIC_BASE + int(child.id[:6], 16) % 100000
     child.rule_description = describe_rules(child)
     return child
+
+
+def evolve_pareto(population: Sequence[Tuple[StrategyDefinition, Sequence[float]]],
+                  n_offspring: int, rng: Optional[random.Random] = None
+                  ) -> List[StrategyDefinition]:
+    """NSGA-II selection on (strategy, objectives) pairs -> offspring batch.
+
+    Parents are chosen by binary tournament on (non-domination rank,
+    crowding distance): a lower front wins; within the same front the less
+    crowded candidate wins, keeping the search spread along the whole
+    profit/risk/stability frontier instead of collapsing onto one scalar
+    compromise. Offspring are produced by the same crossover/mutate
+    operators as the scalar path.
+    """
+    rng = rng or random.Random()
+    if not population:
+        return []
+    from factory.pareto import nsga2_rank
+    ranks = nsga2_rank([tuple(obj) for _, obj in population])
+
+    def _better(i: int, j: int) -> int:
+        (ri, di), (rj, dj) = ranks[i], ranks[j]
+        if ri != rj:
+            return i if ri < rj else j
+        return i if di >= dj else j
+
+    def pick() -> StrategyDefinition:
+        i = rng.randrange(len(population))
+        j = rng.randrange(len(population))
+        return population[_better(i, j)][0]
+
+    offspring: List[StrategyDefinition] = []
+    for _ in range(n_offspring):
+        if len(population) >= 2 and rng.random() < 0.5:
+            child = crossover(pick(), pick(), rng)
+        else:
+            child = mutate(pick(), rng)
+        offspring.append(child)
+    return offspring
 
 
 def evolve(population: Sequence[Tuple[StrategyDefinition, float]],

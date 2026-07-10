@@ -25,6 +25,15 @@ MT5_METAEDITOR_PATH: Optional[str] = None
 MT5_RUN_TIMEOUT_SECONDS = 1800       # single headless backtest hard timeout
 MT5_COMPILE_TIMEOUT_SECONDS = 180    # metaeditor64 compile hard timeout
 
+# Multi-instance MT5 pool (jobs/mt5_pool.py): terminal64.exe paths of
+# PORTABLE-MODE installs, one per concurrent tester lane. Each install owns
+# its own data directory (launched with /portable), so N instances can run
+# testers in parallel. Empty = legacy single shared install, one run at a
+# time, interactive terminal must be closed. See jobs/mt5_pool.py for the
+# provisioning steps.
+MT5_INSTANCE_PATHS: tuple = ()
+# e.g. (r"C:\\MT5-farm\\a\\terminal64.exe", r"C:\\MT5-farm\\b\\terminal64.exe")
+
 # ---------------------------------------------------------------------------
 # Validation gates (defaults for the AcceptanceCriteria model — every gate is
 # user-configurable per discovery batch from the dashboard)
@@ -65,6 +74,40 @@ MC_START_JITTER_BARS = 50    # random warm-up offset (first-bar jitter)
 MC_RESAMPLES = 200           # trade-order resampling draws (equity bootstrap)
 MC_MIN_PROFITABLE = 0.80     # gate: fraction of MC runs that must be profitable
 MC_MAX_DD_P95 = 25.0         # gate: 95th-percentile max drawdown limit (%)
+# Price-path block bootstrap: re-run the strategy on counterfactual histories
+# rebuilt from resampled blocks of real bar returns (autocorrelation and vol
+# clustering preserved inside blocks, the realized path destroyed). A milder
+# gate than the perturbation battery because genuine long-horizon trends are
+# legitimately absent from bootstrapped paths. 0 runs disables.
+MC_PATH_RUNS = 10
+MC_PATH_BLOCK_BARS = 96      # block length in bars (~1 day of M15)
+MC_MIN_PATH_PROFITABLE = 0.60
+
+# ---------------------------------------------------------------------------
+# Simulator execution realism
+# ---------------------------------------------------------------------------
+# Session-aware dynamic costs: spread widens by hour-of-day/weekday (rollover,
+# Asian session, weekend gaps) and slippage scales with realized volatility.
+# The user's configured spread/slippage remain the typical (London) base cost.
+# Applies to specs inferred from data; explicitly constructed SymbolSpec
+# objects (tests) keep flat static costs unless dynamic_costs=True is set.
+SIMULATOR_DYNAMIC_COSTS = True
+
+# Intrabar SL/TP ambiguity resolution ("which was hit first?"):
+#   "conservative" — legacy: SL always assumed first (pessimistic)
+#   "path"         — OHLC path heuristic (bullish bar: open->low->high->close)
+#   "m1"           — replay real M1 bars inside each strategy bar; falls back
+#                    to "path" when M1 data is unavailable or synthetic
+SIMULATOR_INTRABAR_MODE = "m1"
+
+# ---------------------------------------------------------------------------
+# Genetic search
+# ---------------------------------------------------------------------------
+# NSGA-II multi-objective evolution: parents are selected by Pareto rank +
+# crowding over (net profit, -max DD, equity R^2, trade count) instead of the
+# single scalar fitness, so discovery explores the whole profit/risk/
+# stability frontier. False falls back to scalar tournament selection.
+PARETO_EVOLUTION = True
 
 # ---------------------------------------------------------------------------
 # Engine / account defaults

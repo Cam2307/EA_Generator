@@ -10,6 +10,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import streamlit as st
 
+from app.components import theme
 from config import settings
 from factory.storage import Storage
 from jobs import worker
@@ -20,36 +21,7 @@ st.set_page_config(
     layout="wide",
 )
 
-st.markdown(
-    """
-    <style>
-    header[data-testid="stHeader"] {
-        height: 0 !important;
-        min-height: 0 !important;
-        background: transparent !important;
-        border: none !important;
-    }
-    header[data-testid="stHeader"] [data-testid="stToolbar"] {
-        display: none !important;
-    }
-    .ea-page-title {
-        margin: 0 0 0.2rem;
-        font-size: 1.65rem;
-        font-weight: 700;
-        color: #E8EAED;
-        letter-spacing: -0.02em;
-    }
-    .ea-page-sub {
-        margin: 0 0 1.25rem;
-        font-size: 0.9rem;
-        color: #8B95A5;
-        line-height: 1.55;
-        max-width: 46rem;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+theme.inject_global_css()
 
 _NAV_OPTIONS = (
     ":material/radar: Discovery",
@@ -70,21 +42,60 @@ def get_storage() -> Storage:
     return Storage()
 
 
+def _status_chips(storage: Storage) -> list[str]:
+    """Live agent + library status chips for the hero header."""
+    chips: list[str] = []
+    try:
+        state = storage.get_agent_state()
+        if state.get("status") == "running" or state.get("enabled"):
+            chips.append(theme.chip("Discovery agent active", "teal"))
+        else:
+            chips.append(theme.chip("Agent idle", "gray"))
+        active = [j for j in storage.list_jobs("discovery")
+                  if j.status.value == "RUNNING"]
+        if active:
+            chips.append(theme.chip(
+                f"{len(active)} job(s) in flight", "amber"))
+    except Exception:
+        pass
+    return chips
+
+
+def _kpi_strip(storage: Storage) -> None:
+    """Factory-wide numbers, cheap single-row queries only."""
+    try:
+        total = storage.count_validated(passed_only=None)
+        passing = storage.count_validated(passed_only=True)
+        states = storage.promotion_state_counts()
+        promoted = states.get("promoted_live_watchlist", 0)
+        edge = states.get("edge_positive", 0)
+        pass_rate = f"{passing / total:.0%}" if total else "—"
+        theme.kpi_row(
+            [
+                ("Candidates validated", f"{total:,}", ""),
+                ("Passing library", f"{passing:,}", "good" if passing else ""),
+                ("Pass rate", pass_rate, ""),
+                ("Edge positive", f"{edge:,}", "accent" if edge else ""),
+                ("Promoted / watchlist", f"{promoted:,}",
+                 "accent" if promoted else ""),
+            ],
+        )
+    except Exception:
+        pass
+
+
 def main() -> None:
     queue = get_queue()
     storage = get_storage()
 
-    st.markdown(
-        '<p class="ea-page-title">'
-        ':material/precision_manufacturing: MQL5 EA Factory</p>',
-        unsafe_allow_html=True,
+    theme.hero(
+        "MQL5 EA Factory",
+        "Generate, backtest, validate, curate, and export MetaTrader 5 "
+        "Expert Advisors. The simulator is a pre-filter — final verification "
+        "belongs in the real MT5 Strategy Tester.",
+        chips=_status_chips(storage),
     )
-    st.markdown(
-        '<p class="ea-page-sub">Generate, backtest, validate, curate, and export '
-        "MetaTrader 5 Expert Advisors. The simulator is a pre-filter — final "
-        "verification belongs in the real MT5 Strategy Tester.</p>",
-        unsafe_allow_html=True,
-    )
+    _kpi_strip(storage)
 
     # Segmented control (not st.tabs): hidden tabs still execute their bodies
     # on every rerun, so Gallery/Export would deserialize the full validation

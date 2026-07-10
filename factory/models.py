@@ -119,7 +119,9 @@ class TradeManagement(BaseModel):
       atr_period, atr_sl_mult, tp_rr, trail_start_points, trail_distance_points,
       trail_atr_mult, chandelier_lookback, trail_step_points, be_trigger_points,
       be_offset_points, risk_percent (%), start_hour, end_hour,
-      max_trades_per_day, daily_loss_pct (%), cooldown_bars.
+      max_trades_per_day, daily_loss_pct (%), cooldown_bars,
+      regime_allow_mask (bitmask over regime codes 0..3), regime_adx_period,
+      regime_adx_min, regime_atr_period, regime_atr_mult.
     """
     sl_mode: StopLossMode = StopLossMode.FIXED
     tp_mode: TakeProfitMode = TakeProfitMode.FIXED
@@ -130,6 +132,17 @@ class TradeManagement(BaseModel):
     limit_trades_per_day: bool = False
     daily_loss_enabled: bool = False
     cooldown_enabled: bool = False
+    # Adaptive regime gate: entries only in market regimes enabled by
+    # regime_allow_mask (bit c allows regime code c — quiet/volatile x
+    # range/trend from ADX + ATR-vs-baseline proxies). Thresholds and the
+    # mask itself are optimizable and exported as EA inputs.
+    regime_filter: bool = False
+    # Adaptive regime sizing: scale the entry lot size by an optimizable
+    # multiplier per regime (params regime_size_quiet_range /
+    # regime_size_quiet_trend / regime_size_vol_range /
+    # regime_size_vol_trend). Shares the classification thresholds with the
+    # regime filter.
+    regime_sizing: bool = False
     params: Dict[str, float] = Field(default_factory=dict)
     ranges: Dict[str, "ParamRange"] = Field(default_factory=dict)
 
@@ -261,6 +274,10 @@ class AcceptanceCriteria(BaseModel):
     min_sharpe: float = 0.0            # 0 disables
     min_r_squared: float = 0.0         # 0 disables
     max_consecutive_losses: int = 0    # 0 disables
+    # Regime gate: worst-regime OOS net loss may not exceed this percent of
+    # the deposit (0 disables). Evaluated in validate_strategy, where the
+    # per-regime breakdown is available.
+    max_regime_loss_pct: float = 0.0
 
     def evaluate(self, oos: "BacktestMetrics", wfe: float) -> List[str]:
         """Return the list of failed-gate reasons (empty == all gates pass)."""
@@ -292,6 +309,17 @@ class AcceptanceCriteria(BaseModel):
         return reasons
 
 
+class RegimeStats(BaseModel):
+    """OOS performance of one market regime (see factory/regime.py)."""
+    code: int = 0
+    name: str = ""
+    trades: int = 0
+    net_profit: float = 0.0
+    profit_factor: float = 0.0
+    win_rate: float = 0.0
+    bar_share: float = 0.0             # fraction of OOS bars in this regime
+
+
 class MonteCarloRun(BaseModel):
     """Summary of a single randomized Monte Carlo re-run."""
     net_profit: float = 0.0
@@ -314,6 +342,9 @@ class MonteCarloResult(BaseModel):
     profit_p95: float = 0.0
     dd_p95: float = 0.0                # 95th percentile (worst-case) max DD %
     resample_dd_p95: float = 0.0       # 95th pct DD from trade-order resampling
+    # price-path block bootstrap (counterfactual histories)
+    path_runs: int = 0
+    path_pct_profitable: float = 0.0   # 0..1 fraction of profitable path runs
     robustness_score: float = 0.0      # 0..100
     # confidence bands over the common bar timeline (thinned)
     band_ts: List[float] = Field(default_factory=list)
@@ -369,6 +400,16 @@ class ValidationReport(BaseModel):
     quality_score: float = 0.0
     # Human-readable score components for transparent ranking/triage.
     quality_breakdown: Dict[str, float] = Field(default_factory=dict)
+    # Selection-bias statistics (see factory/backtest/statistics.py):
+    # Deflated Sharpe Ratio of the OOS zone given how many candidates the
+    # run had tried when this one was validated. ~1.0 = edge survives the
+    # multiple-testing haircut; <= ~0.5 = plausibly pure selection luck.
+    dsr: float = 0.0
+    n_trials: int = 1                  # candidates tried in the run so far
+    # Fraction of walk-forward OOS windows that ended unprofitable.
+    p_oos_loss: float = 0.0
+    # Per-regime OOS performance breakdown (see factory/regime.py).
+    regime_stats: List[RegimeStats] = Field(default_factory=list)
     # Promotion lifecycle: candidate -> validated -> edge_positive -> promoted_live_watchlist.
     promotion_state: str = "candidate"
     # Hard-gate flag for alert eligibility (strict minimum safety gates).

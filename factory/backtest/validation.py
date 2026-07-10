@@ -342,7 +342,8 @@ def validate_strategy(engine: BacktestEngine, strategy: StrategyDefinition,
                       wfo_windows: Optional[int] = None,
                       data_source: Optional[str] = None,
                       cancel_check: CancelCheck = None,
-                      spec_overrides: Optional[Mapping[str, float]] = None
+                      spec_overrides: Optional[Mapping[str, float]] = None,
+                      n_trials: int = 1
                       ) -> ValidationReport:
     """Full pipeline: 70/30 chronological split -> IS optimization (with
     neighborhood-stability scoring) -> OOS test -> anchored + rolling WFO
@@ -384,6 +385,37 @@ def validate_strategy(engine: BacktestEngine, strategy: StrategyDefinition,
 
     wfe = compute_wfe(is_metrics, oos_metrics)
     reasons: List[str] = criteria.evaluate(oos_metrics, wfe)
+
+    # Selection-bias statistics (reported, not gated): how likely is this
+    # OOS Sharpe to be real given how many candidates the run has tried?
+    from factory.backtest.statistics import dsr_from_metrics, p_oos_loss
+    dsr = dsr_from_metrics(oos_metrics, n_trials)
+    oos_loss_frac = p_oos_loss(windows)
+
+    # Per-regime OOS breakdown (simulator only — needs the trade book).
+    # Reported always; gated only when criteria.max_regime_loss_pct is set.
+    regime_stats: List = []
+    if hasattr(engine, "run_with_trades"):
+        from factory.regime import regime_stats_from_book, worst_regime_net
+        try:
+            _raise_if_cancelled(cancel_check)
+            _, oos_book, oos_df = engine.run_with_trades(
+                strategy, _to_dt(split_ts), end,
+                params_override=best_params, deposit=deposit)
+            regime_stats = regime_stats_from_book(oos_df, oos_book)
+        except JobCancelled:
+            raise
+        except Exception:
+            regime_stats = []
+        if regime_stats and criteria.max_regime_loss_pct > 0:
+            worst = worst_regime_net(regime_stats)
+            limit = -deposit * criteria.max_regime_loss_pct / 100.0
+            if worst < limit:
+                worst_name = min(regime_stats,
+                                 key=lambda s: s.net_profit).name
+                reasons.append(
+                    f"worst regime '{worst_name}' loses {worst:.2f}"
+                    f" (> {criteria.max_regime_loss_pct}% of deposit)")
 
     # Monte Carlo robustness gate — only for strategies that pass the base
     # acceptance criteria (no point stress-testing rejects).
@@ -428,4 +460,8 @@ def validate_strategy(engine: BacktestEngine, strategy: StrategyDefinition,
         data_source=data_source or "unknown",
         wfo_train_months=wfo_train,
         wfo_test_months=wfo_test,
+        dsr=dsr,
+        n_trials=max(1, int(n_trials)),
+        p_oos_loss=oos_loss_frac,
+        regime_stats=regime_stats,
     )

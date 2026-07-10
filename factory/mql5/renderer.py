@@ -32,6 +32,10 @@ _TM_NEUTRAL: Dict[str, float] = {
     "be_trigger_points": 300, "be_offset_points": 0, "risk_percent": 1.0,
     "start_hour": 0, "end_hour": 24, "max_trades_per_day": 5,
     "daily_loss_pct": 5, "cooldown_bars": 5,
+    "regime_allow_mask": 15, "regime_adx_period": 14, "regime_adx_min": 25,
+    "regime_atr_period": 14, "regime_atr_mult": 1.25,
+    "regime_size_quiet_range": 1.0, "regime_size_quiet_trend": 1.0,
+    "regime_size_vol_range": 1.0, "regime_size_vol_trend": 1.0,
 }
 _SL_MODE_INT = {StopLossMode.OFF: 0, StopLossMode.FIXED: 1, StopLossMode.ATR: 2}
 _TP_MODE_INT = {TakeProfitMode.OFF: 0, TakeProfitMode.FIXED: 1, TakeProfitMode.RR: 2}
@@ -140,6 +144,17 @@ def _tm_replacements(tm: TradeManagement) -> Dict[str, str]:
         "__TM_DAILY_LOSS_PCT__": val("daily_loss_pct"),
         "__TM_COOLDOWN__": "1" if tm.cooldown_enabled else "0",
         "__TM_COOLDOWN_BARS__": val("cooldown_bars"),
+        "__TM_REGIME_FILTER__": "1" if tm.regime_filter else "0",
+        "__TM_REGIME_MASK__": val("regime_allow_mask"),
+        "__TM_REGIME_ADX_PERIOD__": val("regime_adx_period"),
+        "__TM_REGIME_ADX_MIN__": val("regime_adx_min"),
+        "__TM_REGIME_ATR_PERIOD__": val("regime_atr_period"),
+        "__TM_REGIME_ATR_MULT__": val("regime_atr_mult"),
+        "__TM_REGIME_SIZING__": "1" if tm.regime_sizing else "0",
+        "__TM_RS_QR__": val("regime_size_quiet_range"),
+        "__TM_RS_QT__": val("regime_size_quiet_trend"),
+        "__TM_RS_VR__": val("regime_size_vol_range"),
+        "__TM_RS_VT__": val("regime_size_vol_trend"),
     }
 
 
@@ -169,6 +184,10 @@ def _min_bars(strategy: StrategyDefinition) -> int:
         needed = max(needed, int(tm.params["atr_period"]) * 3)
     if "chandelier_lookback" in tm.params:
         needed = max(needed, int(tm.params["chandelier_lookback"]) + 5)
+    if tm.regime_filter or tm.regime_sizing:
+        # 100-bar ATR baseline + ADX warmup for the regime classifier
+        adx_p = int(tm.params.get("regime_adx_period", 14))
+        needed = max(needed, 100 + adx_p * 3)
     return needed + 10
 
 

@@ -11,7 +11,7 @@ int    g_grid_direction = 0;
 //@SECTION FUNCTIONS
 void OpenEntry(const ENUM_ORDER_TYPE type)
   {
-   const double lots = NormalizeLots(InpLots);
+   const double lots = NormalizeLots(InpLots * TM_RegimeLotMult());
    SendMarketOrder(type, lots, 0.0, 0.0, "EAF_G0");
    if(CountOurPositions() > 0)
      {

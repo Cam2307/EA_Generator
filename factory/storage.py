@@ -130,6 +130,13 @@ CREATE TABLE IF NOT EXISTS agent_state (
     last_progress_email_at REAL,
     updated_at REAL
 );
+CREATE TABLE IF NOT EXISTS run_manifests (
+    job_id TEXT PRIMARY KEY,
+    seed INTEGER,
+    data_sha256 TEXT,
+    body TEXT NOT NULL,
+    created_at REAL
+);
 CREATE TABLE IF NOT EXISTS strategy_metadata (
     strategy_id TEXT PRIMARY KEY,
     sweep_symbol TEXT,
@@ -361,6 +368,28 @@ class Storage:
         with self.connection() as con:
             row = con.execute("SELECT COUNT(*) AS n FROM strategies").fetchone()
         return int(row["n"]) if row else 0
+
+    # ------------------------------------------------------------------
+    # Run manifests (reproducibility)
+    # ------------------------------------------------------------------
+    def save_run_manifest(self, manifest: dict) -> None:
+        """Persist a discovery-run reproducibility manifest (see factory.manifest)."""
+        with self.connection() as con:
+            con.execute(
+                "INSERT OR REPLACE INTO run_manifests"
+                " (job_id, seed, data_sha256, body, created_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (manifest["job_id"], manifest.get("seed"),
+                 (manifest.get("data") or {}).get("sha256"),
+                 json.dumps(manifest), manifest.get("created_at", time.time())),
+            )
+
+    def get_run_manifest(self, job_id: str) -> Optional[dict]:
+        with self.connection() as con:
+            row = con.execute(
+                "SELECT body FROM run_manifests WHERE job_id=?",
+                (job_id,)).fetchone()
+        return json.loads(row["body"]) if row else None
 
     # ------------------------------------------------------------------
     # Validation reports
@@ -693,6 +722,14 @@ class Storage:
         with self.connection() as con:
             row = con.execute(q, tuple(args)).fetchone()
         return int(row["n"]) if row else 0
+
+    def promotion_state_counts(self) -> Dict[str, int]:
+        """Row counts per promotion_state (single GROUP BY, KPI strip)."""
+        with self.connection() as con:
+            rows = con.execute(
+                "SELECT COALESCE(promotion_state, 'candidate') AS state,"
+                " COUNT(*) AS n FROM validations GROUP BY state").fetchall()
+        return {str(r["state"]): int(r["n"]) for r in rows}
 
     def count_validated_by_jobs(
         self, job_ids: Sequence[str],

@@ -57,6 +57,21 @@ input int    Inp_X_daily_loss_enabled    = __TM_DAILY_LOSS__;   // 0=off 1=on
 input double Inp_X_daily_loss_pct        = __TM_DAILY_LOSS_PCT__; // Daily loss halt (%)
 input int    Inp_X_cooldown_enabled      = __TM_COOLDOWN__;     // 0=off 1=on
 input int    Inp_X_cooldown_bars         = __TM_COOLDOWN_BARS__;// Bars to wait after a loss
+//--- Trade management: adaptive regime filter
+input group "=== Trade mgmt: regime filter ==="
+input int    Inp_X_regime_filter      = __TM_REGIME_FILTER__;   // 0=off 1=on
+input int    Inp_X_regime_allow_mask  = __TM_REGIME_MASK__;     // 1=quiet range 2=quiet trend 4=vol range 8=vol trend (sum)
+input int    Inp_X_regime_adx_period  = __TM_REGIME_ADX_PERIOD__; // ADX period (regime trend proxy)
+input double Inp_X_regime_adx_min     = __TM_REGIME_ADX_MIN__;  // ADX above = trending
+input int    Inp_X_regime_atr_period  = __TM_REGIME_ATR_PERIOD__; // ATR period (regime vol proxy)
+input double Inp_X_regime_atr_mult    = __TM_REGIME_ATR_MULT__; // ATR above mult x 100-bar mean = volatile
+//--- Trade management: adaptive regime sizing
+input group "=== Trade mgmt: regime sizing ==="
+input int    Inp_X_regime_sizing            = __TM_REGIME_SIZING__; // 0=off 1=on
+input double Inp_X_regime_size_quiet_range  = __TM_RS_QR__; // Lot multiplier: quiet range
+input double Inp_X_regime_size_quiet_trend  = __TM_RS_QT__; // Lot multiplier: quiet trend
+input double Inp_X_regime_size_vol_range    = __TM_RS_VR__; // Lot multiplier: volatile range
+input double Inp_X_regime_size_vol_trend    = __TM_RS_VT__; // Lot multiplier: volatile trend
 
 __INPUT_BLOCKS__
 
@@ -74,6 +89,8 @@ double   g_tm_day_start_balance = 0.0;
 datetime g_tm_cooldown_until   = 0;
 int      g_tm_prev_positions   = 0;
 double   g_tm_prev_balance     = 0.0;
+int      g_rg_adx_handle       = INVALID_HANDLE;   // regime-filter ADX
+int      g_rg_atr_handle       = INVALID_HANDLE;   // regime-filter ATR
 
 __GLOBAL_DECLS__
 
@@ -88,6 +105,11 @@ int OnInit()
 
    if(Inp_X_sl_mode == 2 || Inp_X_trail_mode == 2 || Inp_X_trail_mode == 3)
       g_tm_atr_handle = iATR(_Symbol, _Period, Inp_X_atr_period);
+   if(Inp_X_regime_filter == 1 || Inp_X_regime_sizing == 1)
+     {
+      g_rg_adx_handle = iADX(_Symbol, _Period, Inp_X_regime_adx_period);
+      g_rg_atr_handle = iATR(_Symbol, _Period, Inp_X_regime_atr_period);
+     }
    g_tm_day_start_balance = AccountInfoDouble(ACCOUNT_BALANCE);
    g_tm_prev_balance = g_tm_day_start_balance;
 
@@ -105,6 +127,10 @@ void OnDeinit(const int reason)
   {
    if(g_tm_atr_handle != INVALID_HANDLE)
       IndicatorRelease(g_tm_atr_handle);
+   if(g_rg_adx_handle != INVALID_HANDLE)
+      IndicatorRelease(g_rg_adx_handle);
+   if(g_rg_atr_handle != INVALID_HANDLE)
+      IndicatorRelease(g_rg_atr_handle);
 __RELEASE_INDICATORS__
    ObjectsDeleteAll(0, "EAF_");
   }
@@ -629,9 +655,11 @@ double TM_PointValue()
    return(tick_value);
   }
 
-// Lot size for an entry: fixed, or risk-% sized off the stop distance.
+// Lot size for an entry: fixed, or risk-% sized off the stop distance,
+// then scaled by the per-regime multiplier (adaptive regime sizing).
 double TM_Lots(const double sl_points)
   {
+   double lots = InpLots;
    if(Inp_X_lot_mode == 1 && sl_points > 0.0)
      {
       const double value_per_point = TM_PointValue();
@@ -639,9 +667,9 @@ double TM_Lots(const double sl_points)
       const double risk_money = equity * Inp_X_risk_percent / 100.0;
       const double denom = sl_points * value_per_point;
       if(denom > 0.0)
-         return(NormalizeLots(SafeDiv(risk_money, denom)));
+         lots = SafeDiv(risk_money, denom);
      }
-   return(NormalizeLots(InpLots));
+   return(NormalizeLots(lots * TM_RegimeLotMult()));
   }
 
 // Reset per-day counters at the start of each new trading day.
@@ -669,6 +697,62 @@ void TM_TrackClosures()
    g_tm_prev_balance = bal;
   }
 
+// Market-regime classification of the last closed bar. Mirrors
+// factory/regime.py::classify_regimes_filter exactly:
+// trend  = ADX(period) > threshold
+// volatile = ATR(period) > mult x mean(ATR over last 100 closed bars)
+// code = trend + 2*volatile (0=quiet range, 1=quiet trend, 2=volatile
+// range, 3=volatile trend). Returns -1 when indicator data is not yet
+// available so callers can fail OPEN (never brick the EA on a fresh chart
+// or in the validator).
+int TM_RegimeCode()
+  {
+   double adx[];
+   if(!SafeCopyBuffer(g_rg_adx_handle, 0, 1, 1, adx))
+      return(-1);
+   double atr[];
+   if(!SafeCopyBuffer(g_rg_atr_handle, 0, 1, 100, atr))
+      return(-1);
+   double sum = 0.0;
+   for(int i = 0; i < 100; i++)
+      sum += atr[i];
+   const double baseline = sum / 100.0;
+   const int is_trend = (adx[0] > Inp_X_regime_adx_min) ? 1 : 0;
+   const int is_volatile = (baseline > 0.0 &&
+                            atr[0] > Inp_X_regime_atr_mult * baseline) ? 1 : 0;
+   return(is_trend + 2 * is_volatile);
+  }
+
+// Adaptive regime gate: entry allowed only when the current regime's bit
+// is set in the allow mask. Fails OPEN when the code is unavailable.
+bool TM_RegimeAllowed()
+  {
+   if(Inp_X_regime_filter != 1)
+      return(true);
+   const int code = TM_RegimeCode();
+   if(code < 0)
+      return(true);
+   return(((Inp_X_regime_allow_mask >> code) & 1) == 1);
+  }
+
+// Adaptive regime sizing: per-regime entry-lot multiplier (1.0 when the
+// feature is off or the regime is unavailable).
+double TM_RegimeLotMult()
+  {
+   if(Inp_X_regime_sizing != 1)
+      return(1.0);
+   const int code = TM_RegimeCode();
+   if(code == 0)
+      return(Inp_X_regime_size_quiet_range);
+   if(code == 1)
+      return(Inp_X_regime_size_quiet_trend);
+   if(code == 2)
+      return(Inp_X_regime_size_vol_range);
+   if(code == 3)
+      return(Inp_X_regime_size_vol_trend);
+   return(1.0);
+  }
+
 // Account-level entry gates.
 bool TM_EntryAllowed()
   {
@@ -693,6 +777,8 @@ bool TM_EntryAllowed()
          return(false);
      }
    if(Inp_X_cooldown_enabled == 1 && TimeCurrent() < g_tm_cooldown_until)
+      return(false);
+   if(!TM_RegimeAllowed())
       return(false);
    return(true);
   }

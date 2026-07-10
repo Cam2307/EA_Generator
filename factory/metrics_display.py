@@ -76,6 +76,36 @@ def data_source_badge(source: str) -> str:
     return f":{color}[{data_source_label(source)}]"
 
 
+def dsr_label(dsr: float, n_trials: int) -> str:
+    """Human-readable Deflated Sharpe Ratio badge for strategy cards.
+
+    DSR is the probability the OOS Sharpe beats the expected best-of-N
+    zero-skill Sharpe (N = candidates tried by the run).
+    """
+    if dsr >= 0.95:
+        verdict = "very likely real"
+    elif dsr >= 0.80:
+        verdict = "probably real"
+    elif dsr >= 0.50:
+        verdict = "uncertain"
+    else:
+        verdict = "likely selection luck"
+    return f"DSR {dsr:.2f} over {n_trials} trials — {verdict}"
+
+
+def dsr_badge(dsr: float) -> str:
+    """Streamlit markdown badge color-coding the DSR verdict."""
+    if dsr >= 0.95:
+        color = "green"
+    elif dsr >= 0.80:
+        color = "blue"
+    elif dsr >= 0.50:
+        color = "orange"
+    else:
+        color = "red"
+    return f":{color}[DSR {dsr:.2f}]"
+
+
 def wfo_summary(windows: List[WFOWindowResult],
                 mode: Optional[str] = None) -> str:
     """One-line summary of walk-forward window results."""

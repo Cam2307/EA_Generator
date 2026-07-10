@@ -121,6 +121,7 @@ _SORT_OPTIONS: dict = {
     "OOS max drawdown (low → high)": (lambda r, runs: gate_drawdown_pct(r.oos_metrics), False),
     "Degradation (low → high)": (lambda r, runs: r.degradation_pct, False),
     "Stability (high → low)": (lambda r, runs: r.stability_ratio, True),
+    "DSR (high → low)": (lambda r, runs: getattr(r, "dsr", 0.0), True),
 }
 
 SORT_OPTION_LABELS: tuple[str, ...] = tuple(_SORT_OPTIONS.keys())
@@ -204,19 +205,28 @@ def _chart_cache_key(report: ValidationReport) -> str:
 
 
 def render_gallery(storage: Storage) -> None:
-    st.subheader("Strategy gallery")
+    from app.components import theme
+    theme.section(
+        "Strategy gallery",
+        "Curate survivors, compare runs, and combine promoted strategies "
+        "into an HRP portfolio.")
 
     view = st.segmented_control(
         "View",
-        options=["Library", "Results per run"],
+        options=["Library", "Results per run", "Portfolio"],
         default="Library",
         key="gallery_view_mode",
         help="Library shows all survivors with filters. Results per run "
-             "lets you inspect one discovery batch at a time.",
+             "inspects one discovery batch. Portfolio builds an HRP "
+             "allocation over selected strategies.",
     )
     if view == "Results per run":
         from app.components.run_view import render_per_run_section
         render_per_run_section(storage)
+        return
+    if view == "Portfolio":
+        from app.components.portfolio_panel import render_portfolio_panel
+        render_portfolio_panel(storage)
         return
 
     st.markdown("#### Surviving strategies")
@@ -436,10 +446,19 @@ def render_strategy_card(strategy: StrategyDefinition,
         else:
             r3b.metric("MC robustness", "—")
 
+        dsr_part = (f" · DSR {report.dsr:.2f}/{report.n_trials} trials"
+                    if getattr(report, "dsr", 0.0) > 0.0 else "")
         st.caption(
             f"Sharpe {oos.sharpe:.2f} · degradation {report.degradation_pct:.0f}% "
             f"· stability {report.stability_ratio:.2f} · IS "
-            f"{zone_drawdown_label('IS')} {is_dd:.1f}%")
+            f"{zone_drawdown_label('IS')} {is_dd:.1f}%" + dsr_part)
+
+        if getattr(report, "regime_stats", None):
+            traded = [s for s in report.regime_stats if s.trades > 0]
+            if traded:
+                st.caption("Regimes: " + " · ".join(
+                    f"{s.name} {s.net_profit:+.0f} ({s.trades}t, PF {s.profit_factor:.2f})"
+                    for s in traded))
 
         st.plotly_chart(build_equity_figure(report),
                         width="stretch",
