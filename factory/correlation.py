@@ -85,6 +85,25 @@ def max_correlation(report: ValidationReport,
     return best, best_id
 
 
+def novelty_score(fingerprint: Dict[int, float],
+                  reservoir: Sequence[Dict[int, float]]) -> float:
+    """Behavioral novelty of a return stream vs a reservoir of recent ones.
+
+    ``1 - max|corr|`` against the reservoir: 1.0 = nothing like it has been
+    seen (or nothing is measurable), 0.0 = a perfect duplicate. Used as an
+    extra NSGA-II objective so the genetic search spreads across *behaviors*
+    instead of rediscovering the same edge under different indicator names.
+    """
+    if not fingerprint or not reservoir:
+        return 1.0
+    worst = 0.0
+    for other in reservoir:
+        corr = return_correlation(fingerprint, other)
+        if corr is not None and abs(corr) > worst:
+            worst = abs(corr)
+    return round(1.0 - worst, 4)
+
+
 def duplicate_penalty_from_corr(corr: Optional[float],
                                 threshold: float = DUPLICATE_CORR_THRESHOLD,
                                 max_penalty: float = 15.0) -> float:

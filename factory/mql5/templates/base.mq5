@@ -587,20 +587,21 @@ void DashboardUpdate()
   }
 
 //+------------------------------------------------------------------+
-//| Signal evaluation: AND of every entry filter                      |
+//| Signal evaluation: filters vote, the composition rule decides     |
+//| (all = classic AND, any = OR, majority = more than half agree)    |
 //+------------------------------------------------------------------+
 bool SignalLong()
   {
-   bool ok = true;
+   int hits = 0;
 __SIGNAL_LONG__
-   return(ok);
+   return(__SIGNAL_RULE__);
   }
 
 bool SignalShort()
   {
-   bool ok = true;
+   int hits = 0;
 __SIGNAL_SHORT__
-   return(ok);
+   return(__SIGNAL_RULE__);
   }
 
 __FILTER_FUNCTIONS__

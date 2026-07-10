@@ -127,6 +127,26 @@ _SORT_OPTIONS: dict = {
 SORT_OPTION_LABELS: tuple[str, ...] = tuple(_SORT_OPTIONS.keys())
 
 
+
+_RISK_BADGE_COLORS = {"red": "red", "amber": "orange", "violet": "violet"}
+
+
+def risk_style_badge(strategy) -> str:
+    """Streamlit badge for aggressive-recovery execution styles ('' if none).
+
+    Martingale grids and hedge-recovery layers produce the prettiest
+    backtests and the harshest live drawdowns — the label follows the
+    strategy everywhere so that trade-off is never invisible.
+    """
+    from factory.publication import risk_style
+    style = risk_style(strategy)
+    if style is None:
+        return ""
+    label, tone = style
+    color = _RISK_BADGE_COLORS.get(tone, "orange")
+    return f":{color}-badge[:material/warning: {label}]"
+
+
 def sort_reports(reports: list, sort_by: str,
                  runs: dict | None = None) -> list:
     """Return a copy of ``reports`` ordered by the chosen metric."""
@@ -410,7 +430,11 @@ def render_strategy_card(strategy: StrategyDefinition,
                              "Export tab.")
 
         src_badge = data_source_badge(report.data_source)
-        st.markdown(f"{badge} &nbsp; {src_badge}")
+        risk_badge = risk_style_badge(strategy)
+        line = f"{badge} &nbsp; {src_badge}"
+        if risk_badge:
+            line += f" &nbsp; {risk_badge}"
+        st.markdown(line)
         st.caption(
             f"Promotion: {report.promotion_state} · quality score {report.quality_score:.1f}"
         )
@@ -524,7 +548,11 @@ def _render_compact_card(strategy: StrategyDefinition,
              else ":red-badge[:material/cancel: FAIL]")
     with st.container(border=True):
         st.markdown(f"##### {strategy.name}")
-        st.markdown(f"{badge} &nbsp; {data_source_badge(report.data_source)}")
+        compact_line = f"{badge} &nbsp; {data_source_badge(report.data_source)}"
+        compact_risk = risk_style_badge(strategy)
+        if compact_risk:
+            compact_line += f" &nbsp; {compact_risk}"
+        st.markdown(compact_line)
         st.caption(f"Promotion: {report.promotion_state} · score {report.quality_score:.1f}")
         if run_label:
             st.caption(f":material/tag: Run {run_label}")

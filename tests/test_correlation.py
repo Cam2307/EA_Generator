@@ -62,6 +62,24 @@ def test_max_correlation_finds_the_twin():
     assert corr2 is None and cid2 is None
 
 
+def test_novelty_score():
+    from factory.correlation import novelty_score
+
+    rng = np.random.default_rng(21)
+    pnl = rng.normal(0, 50, 60).tolist()
+    fp = daily_returns(_metrics(pnl))
+    twin = daily_returns(_metrics([x * 1.01 for x in pnl]))
+    other = daily_returns(_metrics(rng.normal(0, 50, 60).tolist()))
+
+    assert novelty_score(fp, []) == 1.0            # empty reservoir
+    assert novelty_score({}, [twin]) == 1.0        # unmeasurable fingerprint
+    assert novelty_score(fp, [twin]) < 0.05        # duplicate: near-zero novelty
+    assert novelty_score(fp, [other]) > 0.5        # independent: mostly novel
+    # inverse duplicates are still duplicates
+    inv = daily_returns(_metrics([-x for x in pnl]))
+    assert novelty_score(fp, [inv]) < 0.1
+
+
 def test_duplicate_penalty_curve():
     assert duplicate_penalty_from_corr(None) == 0.0
     assert duplicate_penalty_from_corr(0.4) == 0.0

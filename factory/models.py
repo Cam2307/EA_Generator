@@ -175,6 +175,11 @@ class StrategyDefinition(BaseModel):
     symbol: str = "EURUSD"
     timeframe: str = "M15"
     entry_filters: List[EntryFilter] = Field(default_factory=list)
+    # How multiple entry filters combine into one signal:
+    #   "all"      — every filter must agree (classic AND, the default)
+    #   "any"      — any single filter may trigger (disjunctive strategies)
+    #   "majority" — more than half of the filters must agree
+    signal_logic: str = "all"
     mechanic: ExecutionMechanic
     risk: RiskBlock = Field(default_factory=RiskBlock)
     trade_mgmt: TradeManagement = Field(default_factory=TradeManagement)

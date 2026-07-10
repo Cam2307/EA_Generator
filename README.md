@@ -63,6 +63,9 @@ factory/correlation.py       Return-stream correlation (duplicate-edge curation)
 factory/manifest.py          Reproducibility manifests (seed, data hash, versions)
 factory/reoptimize.py        Online re-optimization of promoted strategies
 factory/portfolio.py         HRP portfolio weights + combined-portfolio metrics
+factory/holdout.py           Untouched holdout: reserved window, one-shot scoring
+factory/publication.py       Publication-tier gates + publish records
+factory/metalabel.py         Meta-labeling diagnostics (logistic, chrono split)
 app/components/theme.py      Shared design system (hero, KPI strip, chips)
 app/components/portfolio_panel.py  Gallery "Portfolio" view (HRP, heatmap)
 factory/discovery_config.py   Shared discovery settings + job payload builder
@@ -252,6 +255,41 @@ Additional honesty statistics on every validation:
 - **Run manifests** — every discovery run persists its concrete seed, full
   payload, a SHA-256 fingerprint of the exact bar data, the realism settings
   in force, and library versions, so any gallery strategy is re-derivable.
+
+## Untouched holdout & publication tier
+
+- **Untouched holdout** (`HOLDOUT_MONTHS`, default 12): the most recent
+  months of history are reserved — the discovery worker clamps every run's
+  end date to the boundary, so no candidate is ever generated or optimized
+  on that window. Each strategy may be scored on the holdout exactly
+  **once** (re-runs require an explicit `force`); the aggregate hit rate of
+  those one-shot evaluations is the factory's master KPI, shown on the
+  Export page.
+- **Publication tier** (`factory/publication.py`, Export page checklist):
+  a far higher bar than the discovery gates — ≥200 OOS trades, DSR ≥ 0.95,
+  WFE ≥ 0.70, MC robustness ≥ 85, edge positive in ≥2 regimes, return
+  stream <0.5 correlated with anything already published, real
+  (non-synthetic) data, and a passed holdout. `publish()` exports the
+  package and records the decision; forced publications are marked.
+- **Risk-style labels**: martingale DCA grids (lot multiplier > 1.0), flat
+  DCA grids, and hedge-recovery strategies carry a warning badge on every
+  result card and a disclosure warning in the publication checklist —
+  flagged, never silently blocked.
+
+## Search-space expansion
+
+- **Composite signal logic** (`StrategyDefinition.signal_logic`): entry
+  filters can combine as ALL (classic AND), ANY (disjunctive), or MAJORITY
+  (vote). Sampled and mutated by the genetic search, simulated exactly, and
+  rendered as a hits-counting `SignalLong()/SignalShort()` in the EA.
+- **Behavioral novelty search** (`NOVELTY_ENABLED`): each candidate's
+  daily-return fingerprint is compared against a reservoir of recent
+  candidates; `1 - max|corr|` joins the NSGA-II objectives so discovery
+  explores new behaviors instead of rediscovering one edge.
+- **Meta-labeling diagnostics** (`factory/metalabel.py`): a chronologically
+  split logistic model tests whether a strategy's winners are predictable
+  from regime/session/direction context (test AUC + expectancy uplift) —
+  the honest precursor to premium filtered variants.
 
 ## Maintenance & portfolio
 

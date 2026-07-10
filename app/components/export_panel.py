@@ -38,6 +38,78 @@ _PACKAGE_PARTS = (
 )
 
 
+_CHECK_LABELS = {
+    "validation_passed": "Validation gates",
+    "real_data": "Real data",
+    "oos_trades": "OOS sample size",
+    "dsr": "Deflated Sharpe",
+    "wfe": "Walk-forward efficiency",
+    "montecarlo": "Monte Carlo robustness",
+    "regimes": "Multi-regime edge",
+    "uncorrelated": "Unique return stream",
+    "holdout": "Untouched holdout",
+}
+
+
+def _render_publication_readiness(storage: Storage,
+                                  selected_ids: list[str]) -> None:
+    """Publication-tier checklist per selected strategy (see
+    factory/publication.py). Exporting a package never requires these; a
+    marketplace *publication* should."""
+    from factory.holdout import evaluate_holdout, factory_hit_rate
+    from factory.publication import evaluate_publication, publish
+
+    theme.section(
+        "Publication readiness",
+        "The marketplace bar — far stricter than the discovery gates.")
+    stats = factory_hit_rate(storage)
+    if stats["evaluated"]:
+        st.caption(
+            f"Factory holdout hit rate: **{stats['hit_rate']:.0%}** over "
+            f"{stats['evaluated']:.0f} one-shot evaluations.")
+
+    for sid in selected_ids:
+        strategy = storage.get_strategy(sid)
+        if strategy is None:
+            continue
+        decision = evaluate_publication(storage, sid)
+        n_ok = sum(1 for v in decision.checks.values() if v)
+        icon = "✅" if decision.ready else "🚧"
+        with st.expander(
+                f"{icon} {strategy.name} — {n_ok}/{len(decision.checks)} "
+                "checks", expanded=not decision.ready):
+            chips = [
+                theme.chip(_CHECK_LABELS.get(name, name),
+                           "teal" if ok else "red")
+                for name, ok in decision.checks.items()]
+            st.markdown(" ".join(chips), unsafe_allow_html=True)
+            for why in decision.reasons:
+                st.caption(f":material/close: {why}")
+            for warn in decision.warnings:
+                st.warning(warn, icon=":material/warning:")
+
+            btn_l, btn_r = st.columns(2)
+            with btn_l:
+                if not decision.checks.get("holdout", True):
+                    if st.button("Run one-shot holdout", key=f"holdout_{sid}",
+                                 help="Scores the strategy ONCE on the "
+                                      "reserved recent window. This cannot "
+                                      "be re-rolled — that's the point."):
+                        res = evaluate_holdout(storage, sid)
+                        (st.success if res.passed else st.error)(
+                            f"Holdout net {res.net_profit:,.0f} · "
+                            f"{res.trade_count} trades · "
+                            f"DD {res.max_dd_pct:.1f}%"
+                            + (f" · {res.error}" if res.error else ""))
+                        st.rerun()
+            with btn_r:
+                if decision.ready and st.button(
+                        "Publish", key=f"publish_{sid}", type="primary"):
+                    record = publish(storage, sid)
+                    st.success(f"Published v{record['version']} -> "
+                               f"{record['package_dir']}")
+
+
 def render_export_panel(storage: Storage) -> None:
     theme.section(
         "Export Marketplace Packages",
@@ -78,6 +150,8 @@ def render_export_panel(storage: Storage) -> None:
             "State": rep.promotion_state if rep else "—",
         })
     st.dataframe(rows, width="stretch", hide_index=True)
+
+    _render_publication_readiness(storage, selected_ids)
 
     if st.button(f"Export {len(selected_ids)} Marketplace Package(s)",
                  type="primary", width="stretch"):

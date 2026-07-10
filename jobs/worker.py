@@ -208,11 +208,13 @@ def _evaluate_candidate(task: Dict) -> Dict:
     engine._cancel_check = cancel_check
     result = {"strategy": strat, "fitness": 0.0, "promising": False,
               "passed": False, "error": None, "cancelled": False,
-              "objectives": None}
+              "objectives": None, "fingerprint": None}
     try:
         promising, m = quick_screen(engine, strat, start, end, deposit, criteria)
         result["fitness"] = screen_fitness(m)
         result["objectives"] = objectives_from_metrics(m)
+        from factory.correlation import daily_returns
+        result["fingerprint"] = daily_returns(m)
         if not promising:
             return result
         result["promising"] = True
@@ -457,6 +459,20 @@ class JobQueue:
         if end.tzinfo is None:
             end = end.replace(tzinfo=timezone.utc)
 
+        # Untouched holdout: discovery may never see the reserved trailing
+        # window (factory/holdout.py). Clamp silently-requested recent data.
+        from factory.holdout import clamp_discovery_end
+        end, holdout_clamped = clamp_discovery_end(end)
+        if end <= start:
+            storage.set_job_status(
+                job_id, JobStatus.FAILED,
+                error="Requested range lies entirely inside the untouched "
+                      "holdout window — move the start date earlier or "
+                      "adjust HOLDOUT_MONTHS.")
+            return
+        if holdout_clamped:
+            payload["holdout_clamped_end"] = end.isoformat()
+
         # Validation gates come from a named level (easy mode) unless the user
         # supplied explicit custom criteria (expert override).
         if payload.get("criteria"):
@@ -506,6 +522,26 @@ class JobQueue:
         survivors = 0         # strategies passing all gates
         errors = 0
         scored: list = []     # (strategy, screen_fitness, objectives) triples
+
+        # Behavioral-novelty reservoir: recent candidates' daily-return
+        # fingerprints. Novelty (1 - max|corr| vs the reservoir) is appended
+        # as an extra NSGA-II objective so the search explores new behaviors
+        # instead of rediscovering the same edge under different indicators.
+        from factory.correlation import daily_returns as _fp_of, novelty_score
+        fingerprints: list = []
+        _novelty_cap = int(getattr(settings, "NOVELTY_RESERVOIR", 200))
+        _novelty_on = bool(getattr(settings, "NOVELTY_ENABLED", True))
+
+        def _with_novelty(objectives, fingerprint):
+            """Append the novelty objective and grow the reservoir."""
+            if objectives is None:
+                return None
+            nov = (novelty_score(fingerprint or {}, fingerprints)
+                   if _novelty_on else 1.0)
+            if fingerprint:
+                fingerprints.append(fingerprint)
+                del fingerprints[:-_novelty_cap]
+            return tuple(objectives) + (nov,)
         generation = 0
         persist_state = {"ts": 0.0, "tested": 0}
 
@@ -677,7 +713,9 @@ class JobQueue:
                                               metadata=_candidate_meta(strat, report))
                             scored.append((strat,
                                            screen_fitness(report.oos_metrics),
-                                           objectives_from_metrics(report.oos_metrics)))
+                                           _with_novelty(
+                                               objectives_from_metrics(report.oos_metrics),
+                                               _fp_of(report.oos_metrics))))
                             if report.passed:
                                 survivors += 1
                             _persist_progress()
@@ -753,7 +791,9 @@ class JobQueue:
                                                       "generation": strat.lineage.generation,
                                                   })
                             scored.append((strat, screen_fitness(report.oos_metrics),
-                                           objectives_from_metrics(report.oos_metrics)))
+                                           _with_novelty(
+                                               objectives_from_metrics(report.oos_metrics),
+                                               _fp_of(report.oos_metrics))))
                             if report.passed:
                                 survivors += 1
                         else:
@@ -773,7 +813,8 @@ class JobQueue:
                                 continue
 
                             scored.append((strat, screen_fitness(m),
-                                           objectives_from_metrics(m)))
+                                           _with_novelty(objectives_from_metrics(m),
+                                                         _fp_of(m))))
                             if not promising:
                                 continue
                             screened_in += 1
@@ -841,7 +882,8 @@ class JobQueue:
                                 continue
                             tested += 1
                             scored.append((res["strategy"], res["fitness"],
-                                           res.get("objectives")))
+                                           _with_novelty(res.get("objectives"),
+                                                         res.get("fingerprint"))))
                             if res["promising"]:
                                 screened_in += 1
                                 if res["passed"]:

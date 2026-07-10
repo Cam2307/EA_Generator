@@ -535,6 +535,15 @@ def _apply_advanced_risk_profile(strat: StrategyDefinition, rng: random.Random,
 def describe_rules(strategy: StrategyDefinition) -> str:
     """Human-readable entry/exit rule math for the curation UI and .md export."""
     lines: List[str] = []
+    if len(strategy.entry_filters) >= 2:
+        logic = getattr(strategy, "signal_logic", "all")
+        if logic == "any":
+            lines.append("Entry signal: ANY single filter below may trigger.")
+        elif logic == "majority":
+            need = len(strategy.entry_filters) // 2 + 1
+            lines.append(
+                f"Entry signal: at least {need} of "
+                f"{len(strategy.entry_filters)} filters below must agree.")
     for f in strategy.entry_filters:
         p = f.params
         if f.type == EntryFilterType.PRICE_ACTION_BREAKOUT:
@@ -718,8 +727,20 @@ def random_strategy(symbol: str, timeframe: str,
         type=mech_type, params=_sample_params(MECHANIC_PARAM_SPECS[mech_type], rng),
         ranges=dict(MECHANIC_PARAM_SPECS[mech_type]),
     )
+    # Signal-composition logic: with 2+ filters, occasionally combine them
+    # disjunctively (any) or by vote (majority) instead of the classic AND —
+    # a cheap but genuine expansion of the searchable strategy space.
+    signal_logic = "all"
+    if len(filters) >= 2:
+        roll = rng.random()
+        if roll > 0.85:
+            signal_logic = "majority"
+        elif roll > 0.60:
+            signal_logic = "any"
+
     strat = StrategyDefinition(
         symbol=symbol, timeframe=timeframe, entry_filters=filters,
+        signal_logic=signal_logic,
         mechanic=mechanic, risk=RiskBlock(),
         trade_mgmt=random_trade_mgmt(mech_type, rng, allowed_tm_features),
         lineage=Lineage(generation=generation),
@@ -763,6 +784,11 @@ def mutate(strategy: StrategyDefinition, rng: Optional[random.Random] = None,
     clone = strategy.model_copy(deep=True)
     clone.id = StrategyDefinition(mechanic=clone.mechanic).id  # new uuid
     mutations: List[str] = []
+    if len(clone.entry_filters) >= 2 and rng.random() < 0.10:
+        options = [x for x in ("all", "any", "majority")
+                   if x != clone.signal_logic]
+        clone.signal_logic = rng.choice(options)
+        mutations.append(f"signal_logic={clone.signal_logic}")
     blocks = list(clone.entry_filters) + [clone.mechanic, clone.trade_mgmt]
     for block in blocks:
         for name, r in block.ranges.items():
@@ -810,6 +836,7 @@ def crossover(a: StrategyDefinition, b: StrategyDefinition,
     child = StrategyDefinition(
         symbol=a.symbol, timeframe=a.timeframe,
         entry_filters=[f.model_copy(deep=True) for f in chosen],
+        signal_logic=(a.signal_logic if len(chosen) >= 2 else "all"),
         mechanic=a.mechanic.model_copy(deep=True), risk=a.risk.model_copy(deep=True),
         trade_mgmt=a.trade_mgmt.model_copy(deep=True),
         lineage=Lineage(parents=[a.id, b.id],

@@ -137,6 +137,19 @@ CREATE TABLE IF NOT EXISTS run_manifests (
     body TEXT NOT NULL,
     created_at REAL
 );
+CREATE TABLE IF NOT EXISTS holdout_results (
+    strategy_id TEXT PRIMARY KEY,
+    passed INTEGER NOT NULL DEFAULT 0,
+    net_profit REAL,
+    evaluated_at REAL,
+    body TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS publications (
+    strategy_id TEXT PRIMARY KEY,
+    version TEXT,
+    published_at REAL,
+    body TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS strategy_metadata (
     strategy_id TEXT PRIMARY KEY,
     sweep_symbol TEXT,
@@ -390,6 +403,58 @@ class Storage:
                 "SELECT body FROM run_manifests WHERE job_id=?",
                 (job_id,)).fetchone()
         return json.loads(row["body"]) if row else None
+
+    # ------------------------------------------------------------------
+    # Holdout results (one-shot; see factory/holdout.py)
+    # ------------------------------------------------------------------
+    def save_holdout_result(self, result: dict) -> None:
+        with self.connection() as con:
+            con.execute(
+                "INSERT OR REPLACE INTO holdout_results"
+                " (strategy_id, passed, net_profit, evaluated_at, body)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (result["strategy_id"], int(bool(result.get("passed"))),
+                 result.get("net_profit"), result.get("evaluated_at"),
+                 json.dumps(result)),
+            )
+
+    def get_holdout_result(self, strategy_id: str) -> Optional[dict]:
+        with self.connection() as con:
+            row = con.execute(
+                "SELECT body FROM holdout_results WHERE strategy_id=?",
+                (strategy_id,)).fetchone()
+        return json.loads(row["body"]) if row else None
+
+    def list_holdout_results(self) -> List[dict]:
+        with self.connection() as con:
+            rows = con.execute(
+                "SELECT body FROM holdout_results").fetchall()
+        return [json.loads(r["body"]) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Publications (see factory/publication.py)
+    # ------------------------------------------------------------------
+    def save_publication(self, record: dict) -> None:
+        with self.connection() as con:
+            con.execute(
+                "INSERT OR REPLACE INTO publications"
+                " (strategy_id, version, published_at, body)"
+                " VALUES (?, ?, ?, ?)",
+                (record["strategy_id"], record.get("version"),
+                 record.get("published_at"), json.dumps(record)),
+            )
+
+    def get_publication(self, strategy_id: str) -> Optional[dict]:
+        with self.connection() as con:
+            row = con.execute(
+                "SELECT body FROM publications WHERE strategy_id=?",
+                (strategy_id,)).fetchone()
+        return json.loads(row["body"]) if row else None
+
+    def list_publications(self) -> List[dict]:
+        with self.connection() as con:
+            rows = con.execute("SELECT body FROM publications").fetchall()
+        return [json.loads(r["body"]) for r in rows]
 
     # ------------------------------------------------------------------
     # Validation reports

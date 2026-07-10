@@ -219,8 +219,8 @@ def render_ea(strategy: StrategyDefinition) -> str:
             init_blocks.append(sub("INIT"))
         if sections.get("RELEASE"):
             release_blocks.append(sub("RELEASE"))
-        long_terms.append(f"   ok = ok && {sub('LONG_EXPR').strip()};")
-        short_terms.append(f"   ok = ok && {sub('SHORT_EXPR').strip()};")
+        long_terms.append(f"   if({sub('LONG_EXPR').strip()}) hits++;")
+        short_terms.append(f"   if({sub('SHORT_EXPR').strip()}) hits++;")
         functions.append(sub("FUNCTIONS"))
 
     mech = strategy.mechanic
@@ -233,6 +233,19 @@ def render_ea(strategy: StrategyDefinition) -> str:
     mechanic_functions = msub("FUNCTIONS")
 
     description = strategy.rule_description.replace("\n", " ")[:250]
+
+    # Signal-composition rule (matches simulator.compute_signals):
+    # all -> every filter must agree; any -> one is enough; majority -> vote.
+    n_filters = len(strategy.entry_filters)
+    logic = getattr(strategy, "signal_logic", "all")
+    if n_filters == 0:
+        signal_rule = "true"
+    elif logic == "any":
+        signal_rule = "hits > 0"
+    elif logic == "majority":
+        signal_rule = f"hits >= {n_filters // 2 + 1}"
+    else:
+        signal_rule = f"hits == {n_filters}"
 
     ea = base
     replacements = {
@@ -250,6 +263,7 @@ def render_ea(strategy: StrategyDefinition) -> str:
         "__RELEASE_INDICATORS__": "\n".join(release_blocks),
         "__SIGNAL_LONG__": "\n".join(long_terms),
         "__SIGNAL_SHORT__": "\n".join(short_terms),
+        "__SIGNAL_RULE__": signal_rule,
         "__FILTER_FUNCTIONS__": "\n\n".join(functions),
         "__MECHANIC_FUNCTIONS__": mechanic_functions,
     }

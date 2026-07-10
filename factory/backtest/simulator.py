@@ -384,17 +384,24 @@ def _rvi(df: pd.DataFrame, period: int):
 
 def compute_signals(df: pd.DataFrame, strategy: StrategyDefinition,
                     spec: SymbolSpec) -> Tuple[np.ndarray, np.ndarray, int]:
-    """Return (long_signal, short_signal, warmup_bars). Pure precompute."""
+    """Return (long_signal, short_signal, warmup_bars). Pure precompute.
+
+    Per-filter masks are combined according to ``strategy.signal_logic``:
+    "all" (AND, default), "any" (OR), or "majority" (> half must agree) —
+    matching the hits-counting SignalLong/Short in the rendered EA.
+    """
     close = df["close"].to_numpy()
     high = df["high"].to_numpy()
     low = df["low"].to_numpy()
     n = len(df)
-    long_ok = np.ones(n, dtype=bool)
-    short_ok = np.ones(n, dtype=bool)
     warmup = 1
+    per_long: List[np.ndarray] = []
+    per_short: List[np.ndarray] = []
 
     for f in strategy.entry_filters:
         p = f.params
+        long_ok = np.ones(n, dtype=bool)
+        short_ok = np.ones(n, dtype=bool)
         if f.type == EntryFilterType.PRICE_ACTION_BREAKOUT:
             lb = int(p["lookback"])
             buf = p["buffer_points"] * spec.point
@@ -594,6 +601,24 @@ def compute_signals(df: pd.DataFrame, strategy: StrategyDefinition,
             long_ok &= above & ~prev
             short_ok &= ~above & prev
             warmup = max(warmup, slow_n * 2 + 1)
+
+        per_long.append(long_ok)
+        per_short.append(short_ok)
+
+    logic = getattr(strategy, "signal_logic", "all")
+    if not per_long:
+        long_ok = np.ones(n, dtype=bool)
+        short_ok = np.ones(n, dtype=bool)
+    elif logic == "any":
+        long_ok = np.logical_or.reduce(per_long)
+        short_ok = np.logical_or.reduce(per_short)
+    elif logic == "majority":
+        need = len(per_long) // 2 + 1
+        long_ok = np.sum(per_long, axis=0) >= need
+        short_ok = np.sum(per_short, axis=0) >= need
+    else:                                   # "all" (AND)
+        long_ok = np.logical_and.reduce(per_long)
+        short_ok = np.logical_and.reduce(per_short)
 
     long_ok[:warmup] = False
     short_ok[:warmup] = False

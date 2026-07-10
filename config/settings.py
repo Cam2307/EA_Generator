@@ -101,6 +101,30 @@ SIMULATOR_DYNAMIC_COSTS = True
 SIMULATOR_INTRABAR_MODE = "m1"
 
 # ---------------------------------------------------------------------------
+# Untouched holdout (factory/holdout.py)
+# ---------------------------------------------------------------------------
+# The most recent HOLDOUT_MONTHS of history are reserved: discovery end dates
+# are clamped to the boundary, and each strategy may be scored on the holdout
+# exactly once. The aggregate hit rate of those one-shot evaluations is the
+# factory's master KPI.
+HOLDOUT_ENABLED = True
+HOLDOUT_MONTHS = 12
+HOLDOUT_MAX_DD_PCT = 25.0    # holdout pass also requires DD under this
+
+# ---------------------------------------------------------------------------
+# Publication tier (factory/publication.py) — a far higher bar than the
+# discovery gates. These decide what carries your marketplace reputation.
+# ---------------------------------------------------------------------------
+PUB_MIN_OOS_TRADES = 200
+PUB_MIN_DSR = 0.95
+PUB_MIN_WFE = 0.70
+PUB_MIN_MC_SCORE = 85.0
+PUB_MAX_CORR = 0.5           # vs anything already published
+PUB_MIN_POSITIVE_REGIMES = 2
+PUB_ALLOWED_DATA_SOURCES = ("mt5", "cache")   # synthetic can never publish
+PUB_REQUIRE_HOLDOUT = True
+
+# ---------------------------------------------------------------------------
 # Genetic search
 # ---------------------------------------------------------------------------
 # NSGA-II multi-objective evolution: parents are selected by Pareto rank +
@@ -108,6 +132,12 @@ SIMULATOR_INTRABAR_MODE = "m1"
 # single scalar fitness, so discovery explores the whole profit/risk/
 # stability frontier. False falls back to scalar tournament selection.
 PARETO_EVOLUTION = True
+
+# Behavioral novelty search: append 1 - max|corr| against a reservoir of
+# recent candidates' daily-return fingerprints as an extra NSGA-II objective,
+# so discovery explores new behaviors instead of rediscovering one edge.
+NOVELTY_ENABLED = True
+NOVELTY_RESERVOIR = 200      # fingerprints kept for the novelty comparison
 
 # ---------------------------------------------------------------------------
 # Engine / account defaults
