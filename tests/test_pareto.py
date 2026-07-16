@@ -1,6 +1,8 @@
 """NSGA-II primitives + Pareto evolution (factory.pareto, generator.evolve_pareto)."""
 import random
 
+import pytest
+
 from factory.generator import evolve_pareto, random_strategy
 from factory.models import BacktestMetrics
 from factory.pareto import (
@@ -47,11 +49,12 @@ def test_nsga2_rank_orders_fronts():
 
 def test_objectives_from_metrics():
     m = BacktestMetrics(net_profit=500.0, max_dd_pct=12.0, r_squared=0.8,
-                        trade_count=40)
-    assert objectives_from_metrics(m) == (500.0, -12.0, 0.8, 40.0)
-    # trade-count cap
-    m2 = m.model_copy(update={"trade_count": 5000})
-    assert objectives_from_metrics(m2)[3] == 100.0
+                        trade_count=40, expectancy=12.5)
+    assert objectives_from_metrics(m) == (500.0, -24.0, 0.8, 12.5)
+    # expectancy falls back to net/trades when unset
+    m2 = BacktestMetrics(net_profit=200.0, max_dd_pct=10.0, r_squared=0.5,
+                         trade_count=20)
+    assert objectives_from_metrics(m2)[3] == pytest.approx(10.0)
     # statistically empty runs are pushed to a dominated corner
     empty = BacktestMetrics(net_profit=9999.0, trade_count=2)
     assert objectives_from_metrics(empty)[0] == -1e9

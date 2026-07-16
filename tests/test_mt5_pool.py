@@ -82,7 +82,7 @@ def test_runner_for_binds_portable_nonexclusive():
     assert runner.paths.data_dir == _paths("a").data_dir
 
 
-def test_worker_parallel_mt5_generation(tmp_path):
+def test_worker_parallel_mt5_generation(tmp_path, monkeypatch):
     """Discovery with engine=mt5 + a pool >1 validates via leased runners."""
     import time
     from datetime import datetime, timezone
@@ -95,14 +95,19 @@ def test_worker_parallel_mt5_generation(tmp_path):
 
     class StubRunner:
         name = "mt5"
+        run_count = 0
 
         def run(self, strategy, start, end, params_override=None,
                 deposit=10_000.0):
+            StubRunner.run_count += 1
             years = max((end - start).total_seconds() / YEAR, 1e-9)
             return BacktestMetrics(
                 net_profit=deposit * 0.25 * years, initial_deposit=deposit,
                 start_ts=start.timestamp(), end_ts=end.timestamp(),
                 max_dd_pct=5.0, trade_count=50, profit_factor=1.5)
+
+    class ScreenStub(StubRunner):
+        name = "simulator"
 
     class StubPool(MT5InstancePool):
         def __init__(self, instances):
@@ -117,6 +122,11 @@ def test_worker_parallel_mt5_generation(tmp_path):
     queue = JobQueue(storage)
     pool = StubPool([_paths("a"), _paths("b")])
     queue._mt5_pool = pool
+    engines = {"simulator": ScreenStub(), "mt5": StubRunner()}
+    monkeypatch.setattr(queue, "_make_engine", lambda name: engines[name])
+    # Preflight must not see a real interactive terminal on the developer machine.
+    monkeypatch.setattr(
+        "jobs.worker.interactive_terminal_running", lambda: False)
 
     job_id = "mt5_pool_job"
     assert queue.submit_discovery(job_id, {

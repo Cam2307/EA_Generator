@@ -7,6 +7,7 @@ views stay visually consistent without duplicated markup.
 from __future__ import annotations
 
 import io
+import json
 import zipfile
 from datetime import datetime
 
@@ -14,10 +15,11 @@ import streamlit as st
 
 from app.components.equity_chart import build_equity_figure
 from factory.metrics_display import (
-    data_source_badge, gate_drawdown_pct, sortino_ratio, wfo_summary,
-    zone_drawdown_label,
+    data_source_badge, dsr_badge, dsr_label, gate_drawdown_pct, sortino_ratio,
+    wfo_summary, zone_drawdown_label,
 )
 from factory.assets.exporter import export_marketplace_package
+from factory import validation_levels
 from factory.models import (
     LotMode, StopLossMode, StrategyDefinition, TakeProfitMode, TrailMode,
     ValidationReport,
@@ -227,23 +229,17 @@ def _chart_cache_key(report: ValidationReport) -> str:
 def render_gallery(storage: Storage) -> None:
     from app.components import theme
     theme.section(
-        "Strategy gallery",
-        "Curate survivors, compare runs, and combine promoted strategies "
-        "into an HRP portfolio.")
+        "Strategy library",
+        "Browse all validated strategies, filter by level, and build portfolios.")
 
     view = st.segmented_control(
         "View",
-        options=["Library", "Results per run", "Portfolio"],
+        options=["Library", "Portfolio"],
         default="Library",
         key="gallery_view_mode",
-        help="Library shows all survivors with filters. Results per run "
-             "inspects one discovery batch. Portfolio builds an HRP "
-             "allocation over selected strategies.",
+        help="Library shows all survivors with filters. Portfolio builds an HRP "
+             "allocation over selected strategies. Per-run progress lives on the Runs tab.",
     )
-    if view == "Results per run":
-        from app.components.run_view import render_per_run_section
-        render_per_run_section(storage)
-        return
     if view == "Portfolio":
         from app.components.portfolio_panel import render_portfolio_panel
         render_portfolio_panel(storage)
@@ -257,6 +253,10 @@ def render_gallery(storage: Storage) -> None:
     runs = {j.id: j for j in storage.list_jobs("discovery")}
     page_key = "gallery_lib_page"
 
+    from app.components.run_view import (
+        format_tier_caption, render_min_level_filter,
+    )
+
     with st.container(border=True):
         top_l, top_r = st.columns([3, 1], vertical_alignment="bottom")
         with top_l:
@@ -264,13 +264,13 @@ def render_gallery(storage: Storage) -> None:
             sort_by = render_sort_selectbox(
                 "gallery_sort", index=default_sort_idx, page_key=page_key)
         with top_r:
-            show_all = st.toggle(
-                "Include failed", value=False,
-                help="Show candidates that did not clear every gate. "
-                     "Off by default to keep the library fast.")
+            min_level = render_min_level_filter(
+                "gallery_min_level", page_key=page_key,
+                default=validation_levels.GALLERY_DEFAULT_MIN_LEVEL)
 
         summaries = storage.list_validation_summaries(
-            passed_only=None if show_all else True,
+            passed_only=None,
+            min_level=min_level,
             limit=_GALLERY_SUMMARY_CAP,
         )
 
@@ -327,14 +327,19 @@ def render_gallery(storage: Storage) -> None:
                    f"more (of {total} total).")
         return
 
+    tier_hist = storage.level_counts()
     if total >= _GALLERY_SUMMARY_CAP:
         st.caption(
-            f"Showing top {_GALLERY_SUMMARY_CAP} by WFE "
-            f"({'all' if show_all else 'passed only'}). "
+            f"Showing top {_GALLERY_SUMMARY_CAP} by level/WFE"
+            + (f" (≥ L{min_level})" if min_level else " (full population)")
+            + f". Tiers: {format_tier_caption(tier_hist)}. "
             f"Use filters or Results per run for narrower sets.")
     else:
-        st.caption(f"Showing {len(filtered)} of {total} result"
-                   f"{'s' if total != 1 else ''}.")
+        st.caption(
+            f"Showing {len(filtered)} of {total} result"
+            f"{'s' if total != 1 else ''}"
+            + (f" (≥ L{min_level})" if min_level else "")
+            + f". Tiers: {format_tier_caption(tier_hist)}.")
 
     page_summaries, page, total_pages = _page_slice(
         filtered, page_key, _GALLERY_PAGE_SIZE)
@@ -344,7 +349,10 @@ def render_gallery(storage: Storage) -> None:
 
     page_reports = _hydrate_reports(storage, page_summaries)
     page_strategies = _strategies_for_reports(storage, page_reports, {})
-    render_report_grid(page_reports, page_strategies, runs=runs)
+    render_report_grid(page_reports, page_strategies, runs=runs,
+                       storage=storage)
+
+    _render_insights_section(storage, pick_symbols)
 
 
 def render_report_grid(reports: list, strategies: dict, runs: dict | None = None,
@@ -375,7 +383,8 @@ def render_report_grid(reports: list, strategies: dict, runs: dict | None = None
                          if runs is not None else None)
             with col:
                 render_strategy_card(strategy, report, run_label=run_label,
-                                     key_prefix=key_prefix, compact=compact)
+                                     key_prefix=key_prefix, compact=compact,
+                                     storage=storage)
 
 
 def _strategies_for_reports(storage: Storage, reports: list,
@@ -399,11 +408,51 @@ def _sort_reports(reports: list, sort_by: str) -> list:
     return sort_reports(reports, sort_by)
 
 
+def _truncate_id(sid: str, n: int = 8) -> str:
+    return sid if len(sid) <= n else sid[:n]
+
+
+def _lineage_caption(strategy: StrategyDefinition) -> str:
+    """Compact lineage line: parents, operation, mutations."""
+    lin = strategy.lineage
+    parents = list(lin.parents or [])
+    mutations = list(lin.mutations or [])
+    if len(parents) > 1:
+        operation = "crossover"
+    elif parents:
+        operation = "mutate"
+    else:
+        operation = "random"
+    parts = [f"op {operation}"]
+    if parents:
+        parts.append("parents " + ", ".join(_truncate_id(p) for p in parents[:3]))
+        if len(parents) > 3:
+            parts[-1] += f" +{len(parents) - 3}"
+    if mutations:
+        shown = ", ".join(mutations[:4])
+        if len(mutations) > 4:
+            shown += f" +{len(mutations) - 4}"
+        parts.append(f"Δ {shown}")
+    return " · ".join(parts)
+
+
+def _dsr_display(report: ValidationReport) -> str | None:
+    """Markdown DSR badge + label when DSR or trial count is available."""
+    dsr = float(getattr(report, "dsr", 0.0) or 0.0)
+    n_trials = int(getattr(report, "n_trials", 0) or 0)
+    if dsr <= 0.0 and n_trials <= 0:
+        return None
+    if dsr > 0.0:
+        return f"{dsr_badge(dsr)} · {dsr_label(dsr, max(n_trials, 1))}"
+    return f"DSR n/a · {n_trials} trials"
+
+
 def render_strategy_card(strategy: StrategyDefinition,
                          report: ValidationReport,
                          run_label: str | None = None,
                          key_prefix: str = "",
-                         compact: bool = False) -> None:
+                         compact: bool = False,
+                         storage: Storage | None = None) -> None:
     """Render one strategy result card.
 
     ``compact`` produces a smaller card (tighter header, fewer headline
@@ -417,8 +466,10 @@ def render_strategy_card(strategy: StrategyDefinition,
         return
 
     oos = report.oos_metrics
-    badge = (":green-badge[:material/check_circle: PASS]" if report.passed
-             else ":red-badge[:material/cancel: FAIL]")
+    from app.components.run_view import level_badge
+    tier = level_badge(getattr(report, "highest_level_passed", 0) or 0)
+    badge = (":green-badge[:material/check_circle: ≥ floor]" if report.passed
+             else ":gray-badge[:material/remove: below floor]")
     with st.container(border=True):
         head_l, head_r = st.columns([5, 1], vertical_alignment="center")
         with head_l:
@@ -431,7 +482,7 @@ def render_strategy_card(strategy: StrategyDefinition,
 
         src_badge = data_source_badge(report.data_source)
         risk_badge = risk_style_badge(strategy)
-        line = f"{badge} &nbsp; {src_badge}"
+        line = f"{tier} &nbsp; {badge} &nbsp; {src_badge}"
         if risk_badge:
             line += f" &nbsp; {risk_badge}"
         st.markdown(line)
@@ -444,6 +495,7 @@ def render_strategy_card(strategy: StrategyDefinition,
             f"{strategy.symbol} · {strategy.timeframe} · "
             f"{report.engine} · gen {strategy.lineage.generation} · "
             f"magic {strategy.magic_number}")
+        st.caption(_lineage_caption(strategy))
 
         tm_badges = trade_mgmt_badges(strategy)
         if tm_badges:
@@ -470,12 +522,17 @@ def render_strategy_card(strategy: StrategyDefinition,
         else:
             r3b.metric("MC robustness", "—")
 
-        dsr_part = (f" · DSR {report.dsr:.2f}/{report.n_trials} trials"
-                    if getattr(report, "dsr", 0.0) > 0.0 else "")
+        dsr_md = _dsr_display(report)
+        if dsr_md:
+            st.markdown(dsr_md)
+        is_trials = int(getattr(report, "is_trials", 0) or 0)
+        extra = ""
+        if is_trials > 0:
+            extra = f" · IS trials {is_trials}"
         st.caption(
             f"Sharpe {oos.sharpe:.2f} · degradation {report.degradation_pct:.0f}% "
             f"· stability {report.stability_ratio:.2f} · IS "
-            f"{zone_drawdown_label('IS')} {is_dd:.1f}%" + dsr_part)
+            f"{zone_drawdown_label('IS')} {is_dd:.1f}%" + extra)
 
         if getattr(report, "regime_stats", None):
             traded = [s for s in report.regime_stats if s.trades > 0]
@@ -521,15 +578,121 @@ def render_strategy_card(strategy: StrategyDefinition,
                             f"OOS DD {gate_drawdown_pct(w.oos_metrics):.1f}% · "
                             f"OOS profit {w.oos_metrics.net_profit:,.0f}")
 
+        trace = getattr(report, "param_search_trace", None) or []
+        if trace:
+            with st.expander(f"Param search trace ({len(trace)} top trials)"):
+                rows = []
+                for i, trial in enumerate(trace):
+                    params = trial.get("params") or {}
+                    value = trial.get("value")
+                    preview = ", ".join(
+                        f"{k}={v:g}" if isinstance(v, float) else f"{k}={v}"
+                        for k, v in list(params.items())[:6])
+                    if len(params) > 6:
+                        preview += f" …(+{len(params) - 6})"
+                    rows.append({
+                        "#": i + 1,
+                        "value": (f"{value:.4f}" if isinstance(value, (int, float))
+                                  else str(value)),
+                        "params": preview,
+                    })
+                st.dataframe(rows, hide_index=True, width="stretch")
+
         with st.expander("Exact entry/exit rule math"):
             st.code(strategy.rule_description or "(no description)")
             if report.best_params:
                 st.markdown("**Validated best parameters:**")
                 st.json(report.best_params, expanded=False)
-        if not report.passed and report.reasons:
-            st.warning(" · ".join(report.reasons))
+        if report.reasons:
+            if report.passed:
+                st.caption("Next tier: " + " · ".join(report.reasons[:3]))
+            else:
+                st.warning(" · ".join(report.reasons))
+
+        if report.run_id:
+            _render_manifest_controls(report.run_id, strategy.id,
+                                      key_prefix=key_prefix, storage=storage)
 
         _export_controls(strategy, report, key_prefix=key_prefix)
+
+
+def _render_manifest_controls(run_id: str, strategy_id: str, *,
+                              key_prefix: str = "",
+                              storage: Storage | None = None) -> None:
+    """View / download the discovery-run reproducibility manifest."""
+    with st.expander("View manifest"):
+        store = storage or Storage()
+        manifest = store.get_run_manifest(run_id)
+        if not manifest:
+            st.caption(f"No manifest stored for run `{run_id}`.")
+            return
+        text = json.dumps(manifest, indent=2, sort_keys=True, default=str)
+        st.download_button(
+            "Download manifest JSON",
+            data=text,
+            file_name=f"manifest_{run_id}.json",
+            mime="application/json",
+            key=f"{key_prefix}manifest_dl_{strategy_id}",
+        )
+        st.json(manifest, expanded=False)
+
+
+def _render_insights_section(storage: Storage,
+                             pick_symbols: list | None = None) -> None:
+    """Gallery Insights: offline parameter importance for a symbol/TF."""
+    st.markdown("#### Insights")
+    st.caption(
+        "Permutation importance of validated parameters vs OOS profit factor "
+        "(or WFE). Needs enough strategies with parameter snapshots.")
+
+    summaries = storage.list_strategy_summaries()
+    symbols = sorted({s.symbol for s in summaries if s.symbol})
+    timeframes = sorted({s.timeframe for s in summaries if s.timeframe})
+    if not symbols:
+        st.caption("No strategies yet.")
+        return
+
+    default_sym = (pick_symbols[0] if pick_symbols else None)
+    c1, c2, c3 = st.columns([2, 2, 2], vertical_alignment="bottom")
+    with c1:
+        sym_idx = (symbols.index(default_sym) if default_sym in symbols else 0)
+        sym = st.selectbox("Symbol", symbols, index=sym_idx,
+                           key="insights_symbol")
+    with c2:
+        tf_opts = ["(all)"] + timeframes
+        tf = st.selectbox("Timeframe", tf_opts, index=0,
+                          key="insights_timeframe")
+    with c3:
+        run = st.button("Compute parameter importance",
+                        key="insights_compute", width="stretch")
+
+    if not run and "insights_importance" not in st.session_state:
+        return
+
+    if run:
+        from scripts.parameter_importance import compute_parameter_importance
+        tf_arg = None if tf == "(all)" else tf
+        with st.spinner("Fitting RandomForest…"):
+            rows = compute_parameter_importance(
+                storage, symbol=sym, timeframe=tf_arg)
+        st.session_state["insights_importance"] = {
+            "symbol": sym, "timeframe": tf_arg, "rows": rows,
+        }
+
+    cached = st.session_state.get("insights_importance") or {}
+    rows = cached.get("rows") or []
+    if not rows:
+        st.info("Not enough overlapping parameter snapshots to rank features "
+                "(need ≥5 strategies with shared numeric params).")
+        return
+    scope = cached.get("symbol", sym)
+    tf_lab = cached.get("timeframe") or "all TF"
+    st.caption(f"Top features for {scope} · {tf_lab}")
+    st.dataframe(
+        [{"feature": r["feature"], "importance": f"{r['importance']:.4f}"}
+         for r in rows[:25]],
+        hide_index=True, width="stretch",
+    )
 
 
 def _render_compact_card(strategy: StrategyDefinition,
@@ -544,11 +707,15 @@ def _render_compact_card(strategy: StrategyDefinition,
     Open the Strategy Gallery for the full card.
     """
     oos = report.oos_metrics
-    badge = (":green-badge[:material/check_circle: PASS]" if report.passed
-             else ":red-badge[:material/cancel: FAIL]")
+    from app.components.run_view import level_badge
+    tier = level_badge(getattr(report, "highest_level_passed", 0) or 0)
+    badge = (":green-badge[:material/check_circle: ≥ floor]" if report.passed
+             else ":gray-badge[:material/remove: below floor]")
     with st.container(border=True):
         st.markdown(f"##### {strategy.name}")
-        compact_line = f"{badge} &nbsp; {data_source_badge(report.data_source)}"
+        compact_line = (
+            f"{tier} &nbsp; {badge} &nbsp; {data_source_badge(report.data_source)}"
+        )
         compact_risk = risk_style_badge(strategy)
         if compact_risk:
             compact_line += f" &nbsp; {compact_risk}"
@@ -558,6 +725,12 @@ def _render_compact_card(strategy: StrategyDefinition,
             st.caption(f":material/tag: Run {run_label}")
         st.caption(f"{strategy.symbol} · {strategy.timeframe} · {report.engine} · "
                    f"gen {strategy.lineage.generation}")
+        st.caption(_lineage_caption(strategy))
+
+        dsr = float(getattr(report, "dsr", 0.0) or 0.0)
+        n_trials = int(getattr(report, "n_trials", 0) or 0)
+        if dsr > 0.0:
+            st.markdown(f"{dsr_badge(dsr)} · N={max(n_trials, 1)}")
 
         c1, c2 = st.columns(2)
         c1.metric("OOS net profit", f"{oos.net_profit:,.0f}")

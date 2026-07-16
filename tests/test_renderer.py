@@ -22,7 +22,8 @@ def _strategy():
         mechanic=ExecutionMechanic(
             type=ExecutionMechanicType.DCA_GRID,
             params={"grid_step_points": 200.0, "lot_multiplier": 1.5,
-                    "max_levels": 4.0, "basket_tp_points": 100.0},
+                    "max_levels": 4.0, "basket_tp_points": 100.0,
+                    "basket_sl_points": 300.0},
             ranges={"grid_step_points": ParamRange(min=100, max=500, step=50)}),
         risk=RiskBlock(fixed_lots=0.1, max_spread_points=30),
     )
@@ -100,6 +101,8 @@ def test_mechanic_params_are_inputs_not_literals(ea_source):
     assert "input double Inp_M_lot_multiplier   = 1.5;" in ea_source
     assert "input int    Inp_M_max_levels       = 4;" in ea_source
     assert "input double Inp_M_basket_tp_points = 100;" in ea_source
+    assert "input double Inp_M_basket_sl_points = 300;" in ea_source
+    assert "SyncSharedStopOnAll" in ea_source
     assert "adverse_points >= Inp_M_grid_step_points" in ea_source
     assert "Inp_F0_rsi_period" in ea_source
 

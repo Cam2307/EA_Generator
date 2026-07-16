@@ -10,6 +10,7 @@ be traced back to a reproducible run.
 from __future__ import annotations
 
 import hashlib
+import os
 import platform
 import subprocess
 import sys
@@ -26,11 +27,16 @@ from config import settings
 _RESULT_AFFECTING_SETTINGS = (
     "IS_OOS_SPLIT", "OPT_SAMPLES", "WFO_OPT_SAMPLES", "WFO_WINDOWS",
     "WFO_TRAIN_MONTHS", "WFO_TEST_MONTHS", "WFO_MODES",
+    "OPTUNA_SAMPLER", "OPTUNA_N_STARTUP_TRIALS", "OPTUNA_PRUNE_SEGMENTS",
     "NEIGHBORHOOD_STABILITY", "NEIGHBOR_SAMPLES", "NEIGHBOR_TOP_K",
     "MC_ENABLED", "MC_RUNS", "MC_SPREAD_MAX_POINTS", "MC_SLIPPAGE_MAX_POINTS",
     "MC_PARAM_CHANGE_PROB", "MC_PARAM_MAX_STEPS", "MC_SKIP_ENTRY_PROB",
     "MC_START_JITTER_BARS", "MC_RESAMPLES", "MC_MIN_PROFITABLE",
-    "MC_MAX_DD_P95", "SIMULATOR_DYNAMIC_COSTS", "SIMULATOR_INTRABAR_MODE",
+    "MC_MAX_DD_P95", "MC_PATH_RUNS", "MC_PATH_BLOCK_BARS",
+    "MC_MIN_PATH_PROFITABLE",
+    "SIMULATOR_DYNAMIC_COSTS", "SIMULATOR_INTRABAR_MODE",
+    "SIMULATOR_SCREEN_INTRABAR_MODE", "SIMULATOR_SCREEN_CONFIRM",
+    "SIMULATOR_NUMBA",
     "DEFAULT_DEPOSIT",
 )
 
@@ -61,19 +67,61 @@ def data_fingerprint(df: pd.DataFrame) -> dict:
 
 
 def _git_commit() -> Optional[str]:
+    kwargs: dict = {}
+    if os.name == "nt":
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
     try:
         out = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=settings.PROJECT_ROOT,
-            capture_output=True, text=True, timeout=5)
+            capture_output=True, text=True, timeout=5, **kwargs)
         return out.stdout.strip() or None if out.returncode == 0 else None
     except Exception:
         return None
+
+
+def _engine_path_flags() -> dict:
+    """Record which simulator execution paths are eligible for this run."""
+    numba_ok = False
+    try:
+        from factory.backtest.sim_numba_core import numba_available
+        numba_ok = bool(numba_available())
+    except Exception:
+        numba_ok = False
+    return {
+        "numba_available": numba_ok,
+        "numba_enabled": bool(getattr(settings, "SIMULATOR_NUMBA", False)),
+        "intrabar_mode": str(getattr(settings, "SIMULATOR_INTRABAR_MODE", "")),
+        "screen_intrabar_mode": str(
+            getattr(settings, "SIMULATOR_SCREEN_INTRABAR_MODE", "")),
+        "screen_confirm": bool(
+            getattr(settings, "SIMULATOR_SCREEN_CONFIRM", False)),
+        "neighborhood_stability": bool(
+            getattr(settings, "NEIGHBORHOOD_STABILITY", False)),
+    }
 
 
 def build_manifest(job_id: str, payload: dict, seed: int,
                    df: pd.DataFrame) -> dict:
     """Assemble the reproducibility manifest for one discovery run."""
     import pydantic
+
+    versions = {
+        "python": sys.version.split()[0],
+        "platform": platform.platform(),
+        "numpy": np.__version__,
+        "pandas": pd.__version__,
+        "pydantic": pydantic.VERSION,
+    }
+    try:
+        import optuna
+        versions["optuna"] = getattr(optuna, "__version__", "unknown")
+    except Exception:
+        pass
+    try:
+        import numba
+        versions["numba"] = getattr(numba, "__version__", "unknown")
+    except Exception:
+        pass
 
     return {
         "job_id": job_id,
@@ -82,13 +130,8 @@ def build_manifest(job_id: str, payload: dict, seed: int,
         "data": data_fingerprint(df),
         "settings": {name: getattr(settings, name, None)
                      for name in _RESULT_AFFECTING_SETTINGS},
-        "versions": {
-            "python": sys.version.split()[0],
-            "platform": platform.platform(),
-            "numpy": np.__version__,
-            "pandas": pd.__version__,
-            "pydantic": pydantic.VERSION,
-        },
+        "engine_path": _engine_path_flags(),
+        "versions": versions,
         "git_commit": _git_commit(),
         "created_at": time.time(),
     }

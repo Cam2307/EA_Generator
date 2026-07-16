@@ -54,9 +54,71 @@ def default_criteria() -> AcceptanceCriteria:
     )
 
 
+def estimate_stop_points(strategy: StrategyDefinition, *,
+                         price: float, atr_price: float,
+                         point: float) -> float:
+    """Estimate initial SL distance in points from structural exit modes."""
+    from factory.models import StopLossMode
+    from factory.param_scale import collapse_scaled_point_params
+
+    strat = collapse_scaled_point_params(strategy)
+    tm = strat.trade_mgmt
+    tp = tm.params
+    mp = strat.mechanic.params
+    if tm.sl_mode == StopLossMode.OFF:
+        return 0.0
+    if tm.sl_mode == StopLossMode.ATR and atr_price > 0.0 and point > 0.0:
+        return float(atr_price / point * tp.get("atr_sl_mult", 2.0))
+    if tm.sl_mode == StopLossMode.PERCENT and price > 0.0 and point > 0.0:
+        return float(price * (float(tp.get("sl_pct", 1.0)) / 100.0) / point)
+    return float(mp.get("sl_points", 0.0) or 0.0)
+
+
+def stop_economics_sane(strategy: StrategyDefinition, *,
+                        price: float, atr_price: float, point: float,
+                        spread_points: float, slippage_points: float
+                        ) -> Tuple[bool, str]:
+    """Reject FX-tiny / sub-cost stops before Optuna burns trials.
+
+    Returns ``(ok, reason)``. ATR/percent/FIXED stops must clear a floor of
+    ``SCREEN_MIN_STOP_ATR_MULT × ATR`` and ``SCREEN_MIN_STOP_COST_MULT ×``
+    one-way spread+slip (proxy for round-trip friction).
+    """
+    from factory.models import ExecutionMechanicType, StopLossMode
+
+    if strategy.mechanic.type == ExecutionMechanicType.DCA_GRID:
+        return True, ""
+    if strategy.trade_mgmt.sl_mode == StopLossMode.OFF:
+        return True, ""
+    if point <= 0.0 or price <= 0.0:
+        return True, ""
+
+    sl_pts = estimate_stop_points(
+        strategy, price=price, atr_price=atr_price, point=point)
+    if sl_pts <= 0.0:
+        return False, "stop distance is zero"
+
+    atr_pts = (atr_price / point) if atr_price > 0.0 else 0.0
+    min_atr = float(getattr(settings, "SCREEN_MIN_STOP_ATR_MULT", 0.25))
+    if atr_pts > 0.0 and sl_pts < min_atr * atr_pts:
+        return False, (
+            f"stop {sl_pts:.0f} pts < {min_atr:.2f}×ATR ({atr_pts:.0f} pts)"
+        )
+
+    cost = max(0.0, float(spread_points) + float(slippage_points))
+    min_cost = float(getattr(settings, "SCREEN_MIN_STOP_COST_MULT", 2.0))
+    if cost > 0.0 and sl_pts < min_cost * cost:
+        return False, (
+            f"stop {sl_pts:.0f} pts < {min_cost:.1f}× round-trip cost "
+            f"({cost:.0f} pts)"
+        )
+    return True, ""
+
+
 def quick_screen(engine: BacktestEngine, strategy: StrategyDefinition,
                  start: datetime, end: datetime, deposit: float,
-                 criteria: AcceptanceCriteria
+                 criteria: AcceptanceCriteria,
+                 *, ohlc=None, spec=None
                  ) -> Tuple[bool, BacktestMetrics]:
     """Cheap single-pass pre-filter used to triage thousands of candidates.
 
@@ -65,18 +127,48 @@ def quick_screen(engine: BacktestEngine, strategy: StrategyDefinition,
     are not even profitable on a single straight run over the whole period
     are discarded before spending the expensive full pipeline on them.
     Returns ``(promising, metrics)``.
+
+    When ``ohlc`` / ``spec`` are supplied, economically absurd stops are
+    rejected before the bar loop runs.
     """
+    if ohlc is not None and spec is not None and len(ohlc) > 20:
+        try:
+            import numpy as np
+            closes = ohlc["close"].to_numpy(dtype=float)
+            highs = ohlc["high"].to_numpy(dtype=float)
+            lows = ohlc["low"].to_numpy(dtype=float)
+            price = float(closes[-1])
+            # Simple ATR(14) from the last bars for the economics gate.
+            tr = np.maximum(
+                highs[-15:] - lows[-15:],
+                np.maximum(
+                    np.abs(highs[-15:] - np.roll(closes[-15:], 1)),
+                    np.abs(lows[-15:] - np.roll(closes[-15:], 1)),
+                ),
+            )[1:]
+            atr_price = float(np.mean(tr)) if len(tr) else 0.0
+            ok, reason = stop_economics_sane(
+                strategy, price=price, atr_price=atr_price,
+                point=float(spec.point),
+                spread_points=float(getattr(spec, "spread_points", 0.0)),
+                slippage_points=float(getattr(spec, "slippage_points", 0.0)),
+            )
+            if not ok:
+                return False, BacktestMetrics()
+        except Exception:
+            pass
     try:
         m = engine.run(strategy, start, end, deposit=deposit)
     except Exception:
         return False, BacktestMetrics()
     # loose gates: the strict acceptance criteria are applied later on the
     # OOS zone by the full pipeline. Here we only weed out obvious junk.
+    # Keep the funnel aligned with easy Screener·A (L1) so low tiers fill.
     dd_ceiling = max(criteria.max_dd_pct * 1.5, criteria.max_dd_pct + 10.0)
     promising = (
-        m.trade_count >= max(3, criteria.min_trades)
+        m.trade_count >= 2
         and m.net_profit > 0.0
-        and m.profit_factor >= 1.05
+        and m.profit_factor >= 1.0
         and m.max_dd_pct < dd_ceiling
     )
     return promising, m
@@ -98,7 +190,9 @@ def _equity_curve_fitness(m: BacktestMetrics) -> float:
     """
     if m.trade_count < 3:
         return -1e9
-    base = m.net_profit / (1.0 + m.max_dd_pct / 10.0)
+    # /4.0 weights drawdown ~2.5× harder than the legacy /10.0 divisor so
+    # genetic search prefers lower-DD equity curves among profitable runs.
+    base = m.net_profit / (1.0 + m.max_dd_pct / 4.0)
     if base <= 0.0:
         return base
     smoothness = 0.25 + 0.75 * max(0.0, min(1.0, m.r_squared))
@@ -106,8 +200,19 @@ def _equity_curve_fitness(m: BacktestMetrics) -> float:
 
 
 def screen_fitness(m: BacktestMetrics) -> float:
-    """Genetic-search fitness — biases discovery toward a smooth rising curve."""
-    return _equity_curve_fitness(m)
+    """Genetic-search fitness — smooth rising curve, boosted by edge expectancy."""
+    base = _equity_curve_fitness(m)
+    if base <= 0.0 or m.trade_count < 2:
+        return base
+    exp = m.expectancy if m.expectancy != 0.0 else (
+        m.net_profit / max(m.trade_count, 1)
+    )
+    if exp <= 0.0:
+        return base
+    # Mild boost so positive-expectancy edges outrank equal-profit chop.
+    from factory.edge import edge_score
+    boost = 1.0 + 0.15 * max(0.0, min(2.0, edge_score(m) / max(abs(exp), 1e-9)))
+    return base * boost
 
 
 def compute_wfe(is_metrics: BacktestMetrics, oos_metrics: BacktestMetrics) -> float:
@@ -170,45 +275,207 @@ def _neighbor_sets(params: Dict[str, float], ranges: Dict[str, ParamRange],
     return out
 
 
+def _is_continuous_heavy(ranges: Dict[str, ParamRange]) -> bool:
+    """True when most params have fine-grained steps (favor CMA-ES)."""
+    if not ranges:
+        return False
+    fine = 0
+    for r in ranges.values():
+        if r.step <= 0:
+            continue
+        n_steps = int(round((r.max - r.min) / r.step))
+        if n_steps >= 20:
+            fine += 1
+    return fine >= max(1, len(ranges) // 2)
+
+
+def _suggest_params(trial, ranges: Dict[str, ParamRange], *,
+                    continuous: bool = False) -> Dict[str, float]:
+    """Map ParamRange grids onto Optuna suggestions, then snap to the grid."""
+    out: Dict[str, float] = {}
+    for name, r in ranges.items():
+        if r.step <= 0 or r.max <= r.min:
+            out[name] = float(r.min)
+            continue
+        if continuous:
+            raw = trial.suggest_float(name, float(r.min), float(r.max))
+            out[name] = r.clamp(raw)
+            continue
+        n_steps = int(round((r.max - r.min) / r.step))
+        if n_steps <= 0:
+            out[name] = float(r.min)
+            continue
+        idx = trial.suggest_int(f"{name}__idx", 0, n_steps)
+        out[name] = r.clamp(r.min + idx * r.step)
+    return out
+
+
+def _to_dt(ts: float) -> datetime:
+    return datetime.fromtimestamp(ts, tz=timezone.utc)
+
+
+def _segment_bounds(start: datetime, end: datetime, n_segments: int
+                    ) -> List[Tuple[datetime, datetime]]:
+    """Chronological IS chunks for MedianPruner intermediate reporting."""
+    n_segments = max(1, int(n_segments))
+    t0, t1 = start.timestamp(), end.timestamp()
+    if t1 <= t0 or n_segments == 1:
+        return [(start, end)]
+    span = (t1 - t0) / n_segments
+    out: List[Tuple[datetime, datetime]] = []
+    for i in range(n_segments):
+        a = t0 + i * span
+        b = t1 if i == n_segments - 1 else t0 + (i + 1) * span
+        out.append((_to_dt(a), _to_dt(b)))
+    return out
+
+
 def optimize_is(engine: BacktestEngine, strategy: StrategyDefinition,
                 start: datetime, end: datetime, deposit: float,
                 n_samples: int, rng: random.Random,
                 stability: bool = False,
                 cancel_check: CancelCheck = None
-                ) -> Tuple[Dict[str, float], BacktestMetrics, float]:
-    """Random-search optimization over the strategy's parameter ranges.
+                ) -> Tuple[Dict[str, float], BacktestMetrics, float, int, List[Dict]]:
+    """Optuna (TPE / CMA-ES) optimization over the strategy's parameter ranges.
 
-    Candidate 0 is always the strategy's own current parameters, so the
+    Trial 0 is always the strategy's own current parameters (enqueued), so the
     optimizer can never return something worse than the incumbent.
 
     With ``stability=True`` the top candidates are re-scored by the average
     fitness of their random +/-1-step neighbors (plateau beats peak).
-    Returns ``(best_params, best_metrics, stability_ratio)`` where the
-    ratio is neighborhood-average / own fitness for the winner (1.0 when
-    the stability pass is disabled or not applicable).
+
+    Returns ``(best_params, best_metrics, stability_ratio, is_trials,
+    param_search_trace)``.
     """
-    candidates: List[Dict[str, float]] = [strategy.all_params()]
+    import optuna
+    from optuna.exceptions import TrialPruned
+    from optuna.pruners import MedianPruner
+    from optuna.samplers import CmaEsSampler, TPESampler
+
+    # Optuna is chatty by default; keep discovery logs clean.
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+
     ranges = strategy.all_ranges()
-    candidates += [_sample_param_set(ranges, rng) for _ in range(max(0, n_samples - 1))]
+    incumbent = strategy.all_params()
+    n_samples = max(1, int(n_samples))
+    n_segments = max(1, int(getattr(settings, "OPTUNA_PRUNE_SEGMENTS", 4)))
+    segments = _segment_bounds(start, end, n_segments)
+    seed = rng.randint(0, 2**31 - 1)
+
+    sampler_name = str(getattr(settings, "OPTUNA_SAMPLER", "auto")).lower()
+    if sampler_name == "auto":
+        sampler_name = "cmaes" if _is_continuous_heavy(ranges) else "tpe"
+    n_startup = int(getattr(settings, "OPTUNA_N_STARTUP_TRIALS", 3))
+    use_cmaes = sampler_name == "cmaes" and bool(ranges)
+    if use_cmaes:
+        try:
+            import cmaes  # noqa: F401  — Optuna's CmaEsSampler needs this package
+        except ImportError:
+            use_cmaes = False
+    if use_cmaes:
+        # CMA-ES requires float space; suggest floats then clamp to the grid.
+        sampler = CmaEsSampler(seed=seed, n_startup_trials=min(n_startup, n_samples))
+    else:
+        sampler = TPESampler(seed=seed, n_startup_trials=min(n_startup, n_samples))
+        use_cmaes = False
+
+    pruner = MedianPruner(n_startup_trials=min(n_startup, n_samples),
+                          n_warmup_steps=0)
+    study = optuna.create_study(direction="maximize", sampler=sampler,
+                                pruner=pruner)
+
+    # Enqueue incumbent so trial 0 evaluates the current parameters.
+    if ranges:
+        enqueue = {}
+        for name, r in ranges.items():
+            if r.step <= 0 or r.max <= r.min:
+                continue
+            val = float(incumbent.get(name, r.min))
+            if use_cmaes:
+                enqueue[name] = max(float(r.min), min(float(r.max), val))
+            else:
+                n_steps = int(round((r.max - r.min) / r.step))
+                if n_steps <= 0:
+                    continue
+                idx = int(round((val - r.min) / r.step))
+                enqueue[f"{name}__idx"] = max(0, min(n_steps, idx))
+        if enqueue:
+            study.enqueue_trial(enqueue)
 
     scored: List[Tuple[Dict[str, float], BacktestMetrics, float]] = []
-    for params in candidates:
+
+    def objective(trial: "optuna.Trial") -> float:
         _raise_if_cancelled(cancel_check)
-        try:
-            m = engine.run(strategy, start, end, params_override=params, deposit=deposit)
-        except Exception:
-            continue
-        scored.append((params, m, _fitness(m)))
+        if not ranges:
+            params = dict(incumbent)
+        else:
+            params = _suggest_params(trial, ranges, continuous=use_cmaes)
+            for k, v in incumbent.items():
+                params.setdefault(k, v)
+
+        # Chronological segments: report intermediate fitness for MedianPruner.
+        last_fitness = float("-inf")
+        last_metrics: Optional[BacktestMetrics] = None
+        for step, (_seg_start, seg_end) in enumerate(segments):
+            _raise_if_cancelled(cancel_check)
+            try:
+                m = engine.run(strategy, start, seg_end,
+                               params_override=params, deposit=deposit)
+            except JobCancelled:
+                raise
+            except Exception:
+                raise TrialPruned()
+            last_metrics = m
+            last_fitness = _fitness(m)
+            trial.report(last_fitness, step)
+            if trial.should_prune():
+                raise TrialPruned()
+
+        assert last_metrics is not None
+        scored.append((params, last_metrics, last_fitness))
+        return last_fitness
+
+    try:
+        study.optimize(objective, n_trials=n_samples, catch=(TrialPruned,))
+    except JobCancelled:
+        raise
+
+    is_trials = len(study.trials)
+    trace_n = int(getattr(settings, "OPTUNA_TRACE_TOP_N", 10))
+    completed = [
+        t for t in study.trials
+        if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None
+    ]
+    completed.sort(key=lambda t: t.value, reverse=True)
+    param_trace: List[Dict] = []
+    for t in completed[:trace_n]:
+        if ranges:
+            params = {}
+            for name, r in ranges.items():
+                if use_cmaes and name in t.params:
+                    params[name] = r.clamp(float(t.params[name]))
+                else:
+                    key = f"{name}__idx"
+                    if key in t.params:
+                        params[name] = r.clamp(
+                            r.min + int(t.params[key]) * r.step)
+                    else:
+                        params[name] = incumbent.get(name, r.min)
+            for k, v in incumbent.items():
+                params.setdefault(k, v)
+        else:
+            params = dict(incumbent)
+        param_trace.append({"params": params, "value": float(t.value)})
 
     if not scored:
         m = engine.run(strategy, start, end, deposit=deposit)
-        return strategy.all_params(), m, 1.0
+        return strategy.all_params(), m, 1.0, is_trials, param_trace
 
     scored.sort(key=lambda t: t[2], reverse=True)
 
     if not (stability and settings.NEIGHBORHOOD_STABILITY and ranges):
         best_params, best_metrics, _ = scored[0]
-        return best_params, best_metrics, 1.0
+        return best_params, best_metrics, 1.0, is_trials, param_trace
 
     # neighborhood re-scoring of the top candidates
     best_entry = None
@@ -229,17 +496,13 @@ def optimize_is(engine: BacktestEngine, strategy: StrategyDefinition,
             ratio = nb_score / own_fitness if own_fitness > 0 else 1.0
             best_entry = (params, metrics, max(0.0, round(ratio, 4)))
     assert best_entry is not None
-    return best_entry
+    return (*best_entry, is_trials, param_trace)
 
 
 def _fitness(m: BacktestMetrics) -> float:
     """IS-optimization fitness — same smooth-rising-equity objective as the
     genetic search, so each optimized window prefers straight, steady equity."""
     return _equity_curve_fitness(m)
-
-
-def _to_dt(ts: float) -> datetime:
-    return datetime.fromtimestamp(ts, tz=timezone.utc)
 
 
 def _month_secs(months: int) -> float:
@@ -281,7 +544,7 @@ def walk_forward(engine: BacktestEngine, strategy: StrategyDefinition,
                 continue
             _raise_if_cancelled(cancel_check)
             try:
-                params, is_m, _ = optimize_is(
+                params, is_m, *_rest = optimize_is(
                     engine, strategy, _to_dt(is_start), _to_dt(is_end), deposit,
                     settings.WFO_OPT_SAMPLES, rng, cancel_check=cancel_check,
                 )
@@ -312,7 +575,7 @@ def walk_forward(engine: BacktestEngine, strategy: StrategyDefinition,
 
         _raise_if_cancelled(cancel_check)
         try:
-            params, is_m, _ = optimize_is(
+            params, is_m, *_rest = optimize_is(
                 engine, strategy, _to_dt(is_start), _to_dt(is_end), deposit,
                 settings.WFO_OPT_SAMPLES, rng, cancel_check=cancel_check,
             )
@@ -343,29 +606,44 @@ def validate_strategy(engine: BacktestEngine, strategy: StrategyDefinition,
                       data_source: Optional[str] = None,
                       cancel_check: CancelCheck = None,
                       spec_overrides: Optional[Mapping[str, float]] = None,
-                      n_trials: int = 1
+                      n_trials: int = 1,
+                      floor_level: Optional[int] = None,
+                      ceiling_level: Optional[int] = None,
                       ) -> ValidationReport:
     """Full pipeline: 70/30 chronological split -> IS optimization (with
     neighborhood-stability scoring) -> OOS test -> anchored + rolling WFO
-    -> acceptance-criteria gates -> Monte Carlo robustness gate.
+    -> multi-level population scoring -> Monte Carlo when mid-tier clears.
 
-    ``run_montecarlo=None`` (default) runs Monte Carlo only when it is
-    enabled in settings AND the engine is the simulator (MC is always
-    simulator-based; a stub/MT5 engine skips it unless forced).
+    When ``floor_level`` / ``ceiling_level`` are set, the report is scored
+    against every named validation level L1–L16 (one backtest, nested gates).
+    ``passed`` means the candidate cleared at least ``floor_level``;
+    ``highest_level_passed`` is the best tier cleared (0 if none). Monte Carlo
+    runs once the OOS metrics clear the last pre-MC level (``MC_PRE_LEVEL``),
+    using the L16 MC config so L7–L16 can be scored from one stress test.
 
-    ``spec_overrides`` carries the user-chosen account/execution economics
-    (leverage, spread, slippage, contract size). IS optimization, OOS and
-    walk-forward pick these up through the engine (which was constructed with
-    them); Monte Carlo builds its own spec, so they are forwarded to it
-    explicitly here to keep all stages consistent.
+    Legacy single-criteria mode (no floor/ceiling) keeps the previous boolean
+    gate behavior, with ``highest_level_passed`` set to 1 on pass / 0 on fail.
     """
+    from factory import validation_levels
+    import time as _time
+
+    t_start = _time.perf_counter()
     rng = random.Random(seed)
     criteria = criteria or default_criteria()
     t0, t1 = start.timestamp(), end.timestamp()
     split_ts = t0 + (t1 - t0) * settings.IS_OOS_SPLIT
 
+    tier_mode = floor_level is not None or ceiling_level is not None
+    floor = validation_levels.MIN_LEVEL if floor_level is None else int(floor_level)
+    # Always score the full ladder in tier mode; ceiling_level is accepted for
+    # API compat but scoring/MC depth use MAX_LEVEL.
+    ceiling = validation_levels.MAX_LEVEL
+    floor = max(validation_levels.MIN_LEVEL,
+                min(validation_levels.MAX_LEVEL, floor))
+    ceiling = max(floor, min(validation_levels.MAX_LEVEL, ceiling))
+
     _raise_if_cancelled(cancel_check)
-    best_params, is_metrics, stability_ratio = optimize_is(
+    best_params, is_metrics, stability_ratio, is_trials, param_trace = optimize_is(
         engine, strategy, start, _to_dt(split_ts), deposit,
         settings.OPT_SAMPLES, rng,
         stability=settings.NEIGHBORHOOD_STABILITY, cancel_check=cancel_check,
@@ -373,28 +651,16 @@ def validate_strategy(engine: BacktestEngine, strategy: StrategyDefinition,
     oos_metrics = engine.run(strategy, _to_dt(split_ts), end,
                              params_override=best_params, deposit=deposit)
 
-    windows: List[WFOWindowResult] = []
-    wfo_n = wfo_windows if wfo_windows is not None else settings.WFO_WINDOWS
-    wfo_train = wfo_train_months if wfo_train_months is not None else settings.WFO_TRAIN_MONTHS
-    wfo_test = wfo_test_months if wfo_test_months is not None else settings.WFO_TEST_MONTHS
-    wfo_kwargs = dict(train_months=wfo_train, test_months=wfo_test)
-    for mode in settings.WFO_MODES:
-        windows += walk_forward(engine, strategy, start, end, deposit,
-                                wfo_n, mode, rng, cancel_check=cancel_check,
-                                **wfo_kwargs)
-
     wfe = compute_wfe(is_metrics, oos_metrics)
-    reasons: List[str] = criteria.evaluate(oos_metrics, wfe)
 
     # Selection-bias statistics (reported, not gated): how likely is this
     # OOS Sharpe to be real given how many candidates the run has tried?
     from factory.backtest.statistics import dsr_from_metrics, p_oos_loss
-    dsr = dsr_from_metrics(oos_metrics, n_trials)
-    oos_loss_frac = p_oos_loss(windows)
 
     # Per-regime OOS breakdown (simulator only — needs the trade book).
     # Reported always; gated only when criteria.max_regime_loss_pct is set.
     regime_stats: List = []
+    regime_reasons: List[str] = []
     if hasattr(engine, "run_with_trades"):
         from factory.regime import regime_stats_from_book, worst_regime_net
         try:
@@ -413,17 +679,71 @@ def validate_strategy(engine: BacktestEngine, strategy: StrategyDefinition,
             if worst < limit:
                 worst_name = min(regime_stats,
                                  key=lambda s: s.net_profit).name
-                reasons.append(
+                regime_reasons.append(
                     f"worst regime '{worst_name}' loses {worst:.2f}"
                     f" (> {criteria.max_regime_loss_pct}% of deposit)")
 
-    # Monte Carlo robustness gate — only for strategies that pass the base
-    # acceptance criteria (no point stress-testing rejects).
+    # Nested ladder: if L1 fails, do not spend budget on WFO / MC / higher
+    # levels. Higher tiers are only evaluated when every lower gate clears.
+    l1_clears = True
+    if tier_mode and not regime_reasons:
+        l1_clears = validation_levels.level_clears(
+            validation_levels.get_level(validation_levels.MIN_LEVEL),
+            oos_metrics, wfe, montecarlo=None)
+    elif tier_mode and regime_reasons:
+        l1_clears = False
+
+    windows: List[WFOWindowResult] = []
+    wfo_n = wfo_windows if wfo_windows is not None else settings.WFO_WINDOWS
+    wfo_train = wfo_train_months if wfo_train_months is not None else settings.WFO_TRAIN_MONTHS
+    wfo_test = wfo_test_months if wfo_test_months is not None else settings.WFO_TEST_MONTHS
+    wfo_kwargs = dict(train_months=wfo_train, test_months=wfo_test)
+    if l1_clears:
+        for mode in settings.WFO_MODES:
+            windows += walk_forward(engine, strategy, start, end, deposit,
+                                    wfo_n, mode, rng, cancel_check=cancel_check,
+                                    **wfo_kwargs)
+
+    dsr = dsr_from_metrics(oos_metrics, n_trials)
+    oos_loss_frac = p_oos_loss(windows) if windows else 0.0
+    # Empty WFO after L1 clear is a hard honesty miss (cannot prove folds).
+    if windows:
+        honesty_p_oos = float(oos_loss_frac)
+    elif l1_clears and tier_mode:
+        honesty_p_oos = 1.0
+    else:
+        honesty_p_oos = None
+    honesty = validation_levels.HonestySignals(
+        p_oos_loss=honesty_p_oos,
+        dsr=float(dsr),
+        stability_ratio=float(stability_ratio),
+    )
+
+    # Monte Carlo: only after nested clear through the last pre-MC level
+    # (never run MC when L1–L6 already failed).
     mc_result = None
     if run_montecarlo is None:
         run_montecarlo = settings.MC_ENABLED and \
             getattr(engine, "name", "") == "simulator"
-    if run_montecarlo and not reasons:
+
+    should_run_mc = bool(run_montecarlo) and l1_clears
+    if tier_mode and should_run_mc:
+        pre_hi = validation_levels.highest_level_cleared(
+            oos_metrics, wfe, None,
+            ceiling=validation_levels.MC_PRE_LEVEL, floor=1,
+            honesty=honesty)
+        should_run_mc = pre_hi >= validation_levels.MC_PRE_LEVEL
+        if should_run_mc and mc_config is None:
+            mc_config = validation_levels.mc_config_for(
+                validation_levels.get_level(validation_levels.MAX_LEVEL))
+            if mc_config is None:
+                should_run_mc = False
+    elif should_run_mc:
+        base_reasons = criteria.evaluate(oos_metrics, wfe) + regime_reasons
+        should_run_mc = not base_reasons
+
+    mc_fail_reasons: List[str] = []
+    if should_run_mc:
         from factory.backtest.montecarlo import (
             MonteCarloConfig, montecarlo_for_strategy,
         )
@@ -434,12 +754,53 @@ def validate_strategy(engine: BacktestEngine, strategy: StrategyDefinition,
                 strategy, start, end, deposit, cfg,
                 params_override=best_params, cancel_check=cancel_check,
                 spec_overrides=spec_overrides)
-            if not mc_result.passed:
-                reasons += [f"Monte Carlo: {r}" for r in mc_result.reasons]
+            if not tier_mode and not mc_result.passed:
+                mc_fail_reasons += [
+                    f"Monte Carlo: {r}" for r in mc_result.reasons]
         except JobCancelled:
             raise
         except Exception as exc:
-            reasons.append(f"Monte Carlo failed to run: {exc}")
+            mc_fail_reasons.append(f"Monte Carlo failed to run: {exc}")
+
+    if tier_mode:
+        highest = validation_levels.highest_level_cleared(
+            oos_metrics, wfe, mc_result, ceiling=ceiling, floor=1,
+            honesty=honesty)
+        if regime_reasons:
+            # Regime gate (rare) demotes below floor when configured.
+            highest = 0
+        passed = highest >= floor and not regime_reasons
+        reasons = list(regime_reasons)
+        if not passed:
+            reasons += validation_levels.reasons_for_next_level(
+                oos_metrics, wfe, mc_result,
+                highest=highest, ceiling=ceiling, honesty=honesty)
+            if not reasons and highest < floor:
+                fl = validation_levels.get_level(floor)
+                reasons = [
+                    f"Cleared L{highest} only; floor is L{floor} ({fl.name})"
+                ]
+        elif highest < ceiling:
+            # Still surface what blocks the next tier for population triage.
+            reasons = validation_levels.reasons_for_next_level(
+                oos_metrics, wfe, mc_result,
+                highest=highest, ceiling=ceiling, honesty=honesty)
+        gate_criteria = validation_levels.get_level(floor).criteria
+        levels_map = validation_levels.levels_cleared_map(
+            oos_metrics, wfe, mc_result, ceiling=ceiling, highest=highest,
+            honesty=honesty)
+    else:
+        reasons = criteria.evaluate(oos_metrics, wfe) + regime_reasons + mc_fail_reasons
+        passed = not reasons
+        highest = 1 if passed else 0
+        gate_criteria = criteria
+        levels_map = {"1": bool(passed)} if passed else {}
+
+    duration_ms = round((_time.perf_counter() - t_start) * 1000.0, 3)
+    soft_wfe_clear = False
+    if tier_mode and int(highest) > 0:
+        hi_lvl = validation_levels.get_level(int(highest))
+        soft_wfe_clear = validation_levels.soft_wfe_waived(hi_lvl, oos_metrics, wfe)
 
     return ValidationReport(
         strategy_id=strategy.id,
@@ -447,13 +808,17 @@ def validate_strategy(engine: BacktestEngine, strategy: StrategyDefinition,
         oos_metrics=oos_metrics,
         wfo_windows=windows,
         wfe=round(wfe, 4),
-        passed=not reasons,
+        passed=passed,
+        highest_level_passed=int(highest),
+        soft_wfe_clear=bool(soft_wfe_clear),
+        levels_cleared=levels_map,
+        duration_ms=duration_ms,
         reasons=reasons,
         best_params=best_params,
         engine=getattr(engine, "name", "unknown"),
         is_range=(t0, split_ts),
         oos_range=(split_ts, t1),
-        criteria=criteria,
+        criteria=gate_criteria,
         montecarlo=mc_result,
         degradation_pct=compute_degradation_pct(is_metrics, oos_metrics),
         stability_ratio=stability_ratio,
@@ -462,6 +827,8 @@ def validate_strategy(engine: BacktestEngine, strategy: StrategyDefinition,
         wfo_test_months=wfo_test,
         dsr=dsr,
         n_trials=max(1, int(n_trials)),
+        is_trials=int(is_trials),
+        param_search_trace=param_trace,
         p_oos_loss=oos_loss_frac,
         regime_stats=regime_stats,
     )

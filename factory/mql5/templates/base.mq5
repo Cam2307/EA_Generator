@@ -22,13 +22,15 @@ input bool   InpShowDashboard   = true;        // Show chart dashboard
 
 //--- Trade management: stop loss
 input group "=== Trade mgmt: stop loss ==="
-input int    Inp_X_sl_mode      = __TM_SL_MODE__;    // SL mode: 0=off 1=fixed 2=ATR
+input int    Inp_X_sl_mode      = __TM_SL_MODE__;    // SL mode: 0=off 1=fixed 2=ATR 3=percent
 input int    Inp_X_atr_period   = __TM_ATR_PERIOD__; // ATR period (adaptive SL/trail)
 input double Inp_X_atr_sl_mult  = __TM_ATR_SL_MULT__;// ATR stop multiplier
+input double Inp_X_sl_pct       = __TM_SL_PCT__;     // Percent SL (% of entry price)
 //--- Trade management: take profit
 input group "=== Trade mgmt: take profit ==="
-input int    Inp_X_tp_mode      = __TM_TP_MODE__;    // TP mode: 0=off 1=fixed 2=R:R
+input int    Inp_X_tp_mode      = __TM_TP_MODE__;    // TP mode: 0=off 1=fixed 2=R:R 3=percent
 input double Inp_X_tp_rr         = __TM_TP_RR__;      // Reward:risk multiple
+input double Inp_X_tp_pct        = __TM_TP_PCT__;     // Percent TP (% of entry price)
 //--- Trade management: trailing
 input group "=== Trade mgmt: trailing ==="
 input int    Inp_X_trail_mode           = __TM_TRAIL_MODE__;   // 0=off 1=fixed 2=ATR 3=chandelier
@@ -72,6 +74,21 @@ input double Inp_X_regime_size_quiet_range  = __TM_RS_QR__; // Lot multiplier: q
 input double Inp_X_regime_size_quiet_trend  = __TM_RS_QT__; // Lot multiplier: quiet trend
 input double Inp_X_regime_size_vol_range    = __TM_RS_VR__; // Lot multiplier: volatile range
 input double Inp_X_regime_size_vol_trend    = __TM_RS_VT__; // Lot multiplier: volatile trend
+//--- Trade management: HMM regime filter / sizing (2-state Gaussian on log returns)
+input group "=== Trade mgmt: HMM regime ==="
+input int    Inp_X_hmm_regime_filter  = __TM_HMM_FILTER__; // 0=off 1=on
+input int    Inp_X_hmm_regime_sizing  = __TM_HMM_SIZING__; // 0=off 1=on
+input double Inp_X_hmm_mu0            = __TM_HMM_MU0__;    // Emission mean state 0
+input double Inp_X_hmm_mu1            = __TM_HMM_MU1__;    // Emission mean state 1
+input double Inp_X_hmm_sigma0         = __TM_HMM_SIG0__;   // Emission stdev state 0
+input double Inp_X_hmm_sigma1         = __TM_HMM_SIG1__;   // Emission stdev state 1
+input double Inp_X_hmm_p00            = __TM_HMM_P00__;    // Stay-in-state-0 probability
+input double Inp_X_hmm_p11            = __TM_HMM_P11__;    // Stay-in-state-1 probability
+input double Inp_X_hmm_pi0            = __TM_HMM_PI0__;    // Prior P(state 0)
+input double Inp_X_hmm_min_prob       = __TM_HMM_MIN_P__;  // Min posterior to allow entry
+input int    Inp_X_hmm_allow_mask     = __TM_HMM_MASK__;   // 1=state0 2=state1 3=both
+input double Inp_X_hmm_size_state0    = __TM_HMM_SZ0__;    // Lot multiplier: HMM state 0
+input double Inp_X_hmm_size_state1    = __TM_HMM_SZ1__;    // Lot multiplier: HMM state 1
 
 __INPUT_BLOCKS__
 
@@ -91,6 +108,12 @@ int      g_tm_prev_positions   = 0;
 double   g_tm_prev_balance     = 0.0;
 int      g_rg_adx_handle       = INVALID_HANDLE;   // regime-filter ADX
 int      g_rg_atr_handle       = INVALID_HANDLE;   // regime-filter ATR
+// HMM forward-filter state (mirrors factory/hmm_regime.py::forward_step)
+bool     g_hmm_ready           = false;
+datetime g_hmm_last_bar        = 0;
+double   g_hmm_alpha0          = 0.5;
+double   g_hmm_alpha1          = 0.5;
+double   g_hmm_prev_close      = 0.0;
 
 __GLOBAL_DECLS__
 
@@ -109,6 +132,14 @@ int OnInit()
      {
       g_rg_adx_handle = iADX(_Symbol, _Period, Inp_X_regime_adx_period);
       g_rg_atr_handle = iATR(_Symbol, _Period, Inp_X_regime_atr_period);
+     }
+   if(Inp_X_hmm_regime_filter == 1 || Inp_X_hmm_regime_sizing == 1)
+     {
+      g_hmm_alpha0 = Inp_X_hmm_pi0;
+      g_hmm_alpha1 = 1.0 - Inp_X_hmm_pi0;
+      g_hmm_ready = false;
+      g_hmm_last_bar = 0;
+      g_hmm_prev_close = 0.0;
      }
    g_tm_day_start_balance = AccountInfoDouble(ACCOUNT_BALANCE);
    g_tm_prev_balance = g_tm_day_start_balance;
@@ -633,6 +664,12 @@ double TM_InitialStopPoints(const double base_sl_points)
       if(atr > 0.0)
          return(SafeDiv(atr, _Point) * Inp_X_atr_sl_mult);
      }
+   if(Inp_X_sl_mode == 3)
+     {
+      const double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      if(bid > 0.0 && _Point > 0.0 && Inp_X_sl_pct > 0.0)
+         return((bid * Inp_X_sl_pct / 100.0) / _Point);
+     }
    return(base_sl_points);
   }
 
@@ -643,6 +680,12 @@ double TM_TakeProfitPoints(const double sl_points, const double base_tp_points)
       return(0.0);
    if(Inp_X_tp_mode == 2 && sl_points > 0.0)
       return(sl_points * Inp_X_tp_rr);
+   if(Inp_X_tp_mode == 3)
+     {
+      const double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      if(bid > 0.0 && _Point > 0.0 && Inp_X_tp_pct > 0.0)
+         return((bid * Inp_X_tp_pct / 100.0) / _Point);
+     }
    return(base_tp_points);
   }
 
@@ -670,7 +713,7 @@ double TM_Lots(const double sl_points)
       if(denom > 0.0)
          lots = SafeDiv(risk_money, denom);
      }
-   return(NormalizeLots(lots * TM_RegimeLotMult()));
+   return(NormalizeLots(lots * TM_RegimeLotMult() * TM_HmmLotMult()));
   }
 
 // Reset per-day counters at the start of each new trading day.
@@ -754,6 +797,107 @@ double TM_RegimeLotMult()
    return(1.0);
   }
 
+// Gaussian PDF helper for the HMM emission model (parity with Python).
+double TM_HmmGaussPdf(const double x, const double mu, const double sigma)
+  {
+   const double s = MathMax(sigma, 1e-8);
+   const double z = (x - mu) / s;
+   return(MathExp(-0.5 * z * z) / (s * MathSqrt(2.0 * M_PI) + 1e-12));
+  }
+
+// One causal forward update. Mirrors factory/hmm_regime.py::forward_step.
+void TM_HmmUpdate(const double ret)
+  {
+   double p00 = Inp_X_hmm_p00;
+   double p11 = Inp_X_hmm_p11;
+   if(p00 < 0.01) p00 = 0.01;
+   if(p00 > 0.99) p00 = 0.99;
+   if(p11 < 0.01) p11 = 0.01;
+   if(p11 > 0.99) p11 = 0.99;
+   const double p01 = 1.0 - p00;
+   const double p10 = 1.0 - p11;
+   double e0 = TM_HmmGaussPdf(ret, Inp_X_hmm_mu0, Inp_X_hmm_sigma0);
+   double e1 = TM_HmmGaussPdf(ret, Inp_X_hmm_mu1, Inp_X_hmm_sigma1);
+   if(e0 < 1e-12) e0 = 1e-12;
+   if(e1 < 1e-12) e1 = 1e-12;
+   const double pred0 = g_hmm_alpha0 * p00 + g_hmm_alpha1 * p10;
+   const double pred1 = g_hmm_alpha0 * p01 + g_hmm_alpha1 * p11;
+   const double un0 = pred0 * e0;
+   const double un1 = pred1 * e1;
+   const double total = un0 + un1;
+   if(total <= 1e-12)
+     {
+      g_hmm_alpha0 = 0.5;
+      g_hmm_alpha1 = 0.5;
+      return;
+     }
+   g_hmm_alpha0 = un0 / total;
+   g_hmm_alpha1 = un1 / total;
+  }
+
+// Advance the HMM on each new closed bar. Returns current state code 0/1,
+// or -1 when not yet ready (fail OPEN for gates).
+int TM_HmmState()
+  {
+   if(Inp_X_hmm_regime_filter != 1 && Inp_X_hmm_regime_sizing != 1)
+      return(-1);
+   double close[];
+   ArraySetAsSeries(close, true);
+   if(CopyClose(_Symbol, _Period, 1, 2, close) < 2)
+      return(g_hmm_ready ? ((g_hmm_alpha1 > g_hmm_alpha0) ? 1 : 0) : -1);
+   datetime bar_time[];
+   ArraySetAsSeries(bar_time, true);
+   if(CopyTime(_Symbol, _Period, 1, 1, bar_time) < 1)
+      return(g_hmm_ready ? ((g_hmm_alpha1 > g_hmm_alpha0) ? 1 : 0) : -1);
+   if(bar_time[0] != g_hmm_last_bar)
+     {
+      if(g_hmm_prev_close > 0.0 && close[0] > 0.0)
+        {
+         const double ret = MathLog(close[0] / g_hmm_prev_close);
+         TM_HmmUpdate(ret);
+         g_hmm_ready = true;
+        }
+      else
+        {
+         // First observation: seed prior only; no emission yet.
+         g_hmm_alpha0 = Inp_X_hmm_pi0;
+         g_hmm_alpha1 = 1.0 - Inp_X_hmm_pi0;
+        }
+      g_hmm_prev_close = close[0];
+      g_hmm_last_bar = bar_time[0];
+     }
+   if(!g_hmm_ready)
+      return(-1);
+   return((g_hmm_alpha1 > g_hmm_alpha0) ? 1 : 0);
+  }
+
+// HMM entry gate: allow-mask bit set AND winning-state posterior >= min_prob.
+bool TM_HmmAllowed()
+  {
+   if(Inp_X_hmm_regime_filter != 1)
+      return(true);
+   const int code = TM_HmmState();
+   if(code < 0)
+      return(true);
+   if(((Inp_X_hmm_allow_mask >> code) & 1) != 1)
+      return(false);
+   const double conf = (code == 0) ? g_hmm_alpha0 : g_hmm_alpha1;
+   return(conf >= Inp_X_hmm_min_prob);
+  }
+
+// HMM lot multiplier (1.0 when off or not ready).
+double TM_HmmLotMult()
+  {
+   if(Inp_X_hmm_regime_sizing != 1)
+      return(1.0);
+   const int code = TM_HmmState();
+   if(code == 0)
+      return(Inp_X_hmm_size_state0);
+   if(code == 1)
+      return(Inp_X_hmm_size_state1);
+   return(1.0);
+  }
+
 // Account-level entry gates.
 bool TM_EntryAllowed()
   {
@@ -780,6 +924,8 @@ bool TM_EntryAllowed()
    if(Inp_X_cooldown_enabled == 1 && TimeCurrent() < g_tm_cooldown_until)
       return(false);
    if(!TM_RegimeAllowed())
+      return(false);
+   if(!TM_HmmAllowed())
       return(false);
    return(true);
   }

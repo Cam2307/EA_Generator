@@ -2,13 +2,17 @@
 from __future__ import annotations
 
 import os
+import random
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
 from config import settings
+from factory.logutil import get_logger
 from factory.agent_alerts import (
+    maybe_send_ops_alerts,
     maybe_send_progress_digest,
     maybe_send_quality_alerts,
     sync_promotion_scores,
@@ -16,11 +20,23 @@ from factory.agent_alerts import (
 from factory.discovery_config import (
     DiscoverySettings,
     build_discovery_payload,
+    effective_validation_level,
     settings_from_app,
 )
 from factory.storage import Storage
+from jobs.bandit import (
+    corr_penalties_for_plans,
+    dump_bandit_stats,
+    load_bandit_stats,
+    outcome_weight,
+    record_outcome,
+    record_pull,
+    select_plan,
+)
 from jobs.sweep import plan_sweeps
 from jobs.worker import _pid_alive, get_job_queue
+
+log = get_logger(__name__)
 
 LOCK_PATH = settings.DATA_DIR / "discovery_orchestrator.lock"
 ERROR_LOG_PATH = settings.DATA_DIR / "discovery_agent_error.log"
@@ -28,22 +44,55 @@ SERVICE_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "discovery_ag
 _STARTING_STALE_SECONDS = 5
 _RECOVER_RETRY_SECONDS = 15
 _MAX_RECOVER_SPAWNS = 5
+_ALERT_LOCK = threading.Lock()
+_ALERT_THREAD: threading.Thread | None = None
 
 
-def _python_executable() -> str:
-    """Launch with the same interpreter that hosts the dashboard (venv-aware)."""
+def _project_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _venv_python(root: Path) -> Path:
+    if os.name == "nt":
+        return root / ".venv" / "Scripts" / "python.exe"
+    return root / ".venv" / "bin" / "python"
+
+
+def _python_executable(*, windowless: bool = False) -> str:
+    """Launch with an interpreter that has project dependencies.
+
+    On Windows, Streamlit is often started as
+    ``base_python.exe .venv\\Scripts\\streamlit.exe``, so ``sys.executable`` is
+    the system interpreter (no numpy). Always prefer this repo's ``.venv`` when
+    it exists, then ``VIRTUAL_ENV``, then a ``streamlit.exe`` sibling, then
+    ``sys.executable``.
+    """
+    candidates: list[Path] = []
+    project_venv = _venv_python(_project_root())
+    if project_venv.exists():
+        candidates.append(project_venv)
+    ve = os.environ.get("VIRTUAL_ENV")
+    if ve:
+        ve_py = (
+            Path(ve) / "Scripts" / "python.exe"
+            if os.name == "nt"
+            else Path(ve) / "bin" / "python"
+        )
+        candidates.append(ve_py)
     exe = Path(sys.executable)
     if exe.stem.lower() == "streamlit":
-        venv_py = exe.with_name("python.exe")
-        if venv_py.exists():
-            return str(venv_py)
-        root_py = exe.parent.parent / "python.exe"
-        if root_py.exists():
-            return str(root_py)
-    # Prefer the active interpreter — in a venv this is .../Scripts/python.exe
-    # and includes project dependencies. sys._base_executable is the system
-    # Python outside the venv and often lacks numpy/streamlit/etc.
-    return str(exe)
+        sibling = exe.with_name("python.exe" if os.name == "nt" else "python")
+        candidates.append(sibling)
+        root_py = exe.parent.parent / ("python.exe" if os.name == "nt" else "python")
+        candidates.append(root_py)
+    candidates.append(exe)
+
+    chosen = next((c for c in candidates if c.exists()), exe)
+    if windowless and os.name == "nt":
+        pyw = chosen.with_name("pythonw.exe")
+        if pyw.exists():
+            return str(pyw)
+    return str(chosen)
 
 
 def _windows_subprocess_flags(*, detached: bool = False) -> int:
@@ -127,7 +176,7 @@ def start_orchestrator_process() -> bool:
     ERROR_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     err_log = open(ERROR_LOG_PATH, "ab")  # noqa: SIM115 - inherited by child briefly
     subprocess.Popen(  # noqa: S603
-        [_python_executable(), str(SERVICE_SCRIPT)],
+        [_python_executable(windowless=True), str(SERVICE_SCRIPT)],
         cwd=str(Path(__file__).resolve().parents[1]),
         creationflags=_windows_subprocess_flags(detached=True),
         stdout=subprocess.DEVNULL,
@@ -267,7 +316,7 @@ class OrchestratorSingleton:
         return False
 
 
-def run_orchestrator_forever(sleep_seconds: int = 2) -> None:
+def run_orchestrator_forever(sleep_seconds: int = 1) -> None:
     storage = Storage()
     queue = get_job_queue()
     try:
@@ -307,6 +356,9 @@ def _load_discovery_config(storage: Storage) -> dict:
 
 
 def _tick(storage: Storage, queue, cfg: dict) -> None:
+    import random
+    from datetime import datetime, timezone
+
     discovery: DiscoverySettings = cfg["discovery"]
     jobs = storage.list_jobs("discovery")
     active = [j for j in jobs if j.status.value in ("PENDING", "RUNNING")]
@@ -320,6 +372,8 @@ def _tick(storage: Storage, queue, cfg: dict) -> None:
         base_seed=discovery.base_seed,
     )
     sweep_total = len(plans)
+    bandit = load_bandit_stats(state.get("bandit_stats"))
+    # Heartbeat first so a slow later step cannot leave the UI looking dead.
     agent_updates: dict = {
         "status": "running",
         "heartbeat_at": time.time(),
@@ -328,11 +382,63 @@ def _tick(storage: Storage, queue, cfg: dict) -> None:
         "sweep_total": sweep_total,
         "mode": mode,
     }
+    storage.update_agent_state(**agent_updates)
+
+    # Learn from recently finished jobs tagged with sweep symbol/TF.
+    _update_bandit_from_finished_jobs(storage, state, bandit)
+
+    # Daily wall-clock budget: pause submissions until next UTC day.
+    budget_hours = float(getattr(discovery, "daily_budget_hours", 0.0) or 0.0)
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    budget_day = str(state.get("budget_day_utc") or "")
+    used = float(state.get("budget_seconds_used_today") or 0.0)
+    if budget_day != today:
+        used = 0.0
+        agent_updates["budget_day_utc"] = today
+        agent_updates["budget_seconds_used_today"] = 0.0
+        agent_updates["budget_paused_until"] = None
+    if budget_hours > 0 and used >= budget_hours * 3600.0 and not active:
+        # Pause until next UTC midnight.
+        from datetime import timedelta
+        tomorrow = (datetime.now(timezone.utc).date() + timedelta(days=1))
+        resume_at = datetime(
+            tomorrow.year, tomorrow.month, tomorrow.day, tzinfo=timezone.utc
+        ).timestamp()
+        agent_updates["status"] = "paused_budget"
+        agent_updates["budget_paused_until"] = resume_at
+        agent_updates["message"] = (
+            f"Daily budget exhausted ({budget_hours:.1f}h) — "
+            f"pausing until next UTC day"
+        )
+        agent_updates["bandit_stats"] = dump_bandit_stats(bandit)
+        storage.update_agent_state(**agent_updates)
+        _schedule_alert_pass(storage, cfg)
+        return
+    # Accrue wall-clock while a job is active.
+    if active and budget_hours > 0:
+        agent_updates["budget_seconds_used_today"] = used + 1.0  # tick interval
+        agent_updates["budget_day_utc"] = today
+
+    # One cheap bandit penalty map per tick (must not touch the validations blob).
+    penalties = corr_penalties_for_plans(plans, storage=storage) if plans else {}
+
     if active:
         job = active[0]
         sweep_idx = max(cursor - 1, 0) % sweep_total if sweep_total else 0
         plan = plans[sweep_idx] if plans else None
+        # Prefer the symbol/TF stored on the in-flight job payload.
+        if job.payload.get("symbol") and job.payload.get("timeframe"):
+            from jobs.sweep import SweepPlan
+            plan = SweepPlan(
+                symbol=str(job.payload["symbol"]),
+                timeframe=str(job.payload["timeframe"]),
+                seed=int(job.payload.get("seed") or 0),
+                payload_patch={},
+            )
         agent_updates["current_job_id"] = job.id
+        eff_level = job.payload.get("validation_level")
+        if eff_level is not None:
+            agent_updates["effective_validation_level"] = int(eff_level)
         if plan is not None:
             sweep_label = f"{plan.symbol} · {plan.timeframe}"
             job_detail = job.message or job.status.value.lower()
@@ -340,11 +446,26 @@ def _tick(storage: Storage, queue, cfg: dict) -> None:
         else:
             agent_updates["message"] = job.message or "Running discovery sweep"
     elif plans:
-        plan = plans[cursor % len(plans)]
         agent_updates["current_job_id"] = None
-        agent_updates["message"] = (
-            f"Idle — next sweep: {plan.symbol} · {plan.timeframe}"
+        next_level = effective_validation_level(
+            discovery,
+            sweep_index=cursor,
+            sweep_total=sweep_total,
         )
+        agent_updates["effective_validation_level"] = next_level
+        # Preview the bandit-chosen next arm without recording a pull yet.
+        try:
+            _idx, preview = select_plan(
+                plans, bandit, rng=random.Random(cursor + discovery.base_seed),
+                corr_penalty=penalties)
+            agent_updates["message"] = (
+                f"Idle — next sweep: {preview.symbol} · {preview.timeframe}"
+            )
+        except Exception:
+            plan = plans[cursor % len(plans)]
+            agent_updates["message"] = (
+                f"Idle — next sweep: {plan.symbol} · {plan.timeframe}"
+            )
     else:
         agent_updates["current_job_id"] = None
         agent_updates["message"] = "No sweeps configured — check symbols/timeframes"
@@ -357,25 +478,129 @@ def _tick(storage: Storage, queue, cfg: dict) -> None:
                 f"Batch complete — {len(plans)} sweeps finished"
             )
         else:
-            plan = plans[cursor % len(plans)]
+            _idx, plan = select_plan(
+                plans, bandit,
+                # Deterministic: same cursor + seed → same arm order.
+                rng=random.Random(
+                    (int(cursor) * 1_000_003
+                     + int(discovery.base_seed) * 97
+                     + len(plans)) & 0x7FFFFFFF),
+                corr_penalty=penalties)
+            record_pull(bandit, plan.symbol, plan.timeframe)
+            level = effective_validation_level(
+                discovery,
+                sweep_index=cursor,
+                sweep_total=sweep_total,
+            )
             payload = build_discovery_payload(
                 discovery,
                 symbol=plan.symbol,
                 timeframe=plan.timeframe,
                 seed=plan.seed,
+                validation_level=level,
             )
+            if mode == "continuous":
+                # Keep searching until the user stops the agent. Survivor
+                # targets only apply to one-shot / batch jobs.
+                payload["continuous"] = True
+                payload["target_survivors"] = 10**9
+                # Continuous mass search always uses the simulator for Stage-2
+                # so interactive MT5 / exclusive locks cannot empty the funnel.
+                # Single-run UI can still pick MT5 explicitly.
+                payload["engine"] = "simulator"
             job_id = f"auto_{int(time.time())}_{cursor % len(plans):03d}"
             queue.submit_discovery(job_id, payload)
             storage.update_agent_state(
                 cursor=cursor + 1,
                 jobs_submitted=int(state.get("jobs_submitted", 0)) + 1,
+                bandit_stats=dump_bandit_stats(bandit),
+                last_bandit_job_id=job_id,
             )
             agent_updates["current_job_id"] = job_id
-            agent_updates["message"] = (
-                f"Submitted sweep — {plan.symbol} · {plan.timeframe}"
+            agent_updates["effective_validation_level"] = level
+            lvl_name = ""
+            if not discovery.use_custom:
+                from factory import validation_levels
+
+                lvl_name = validation_levels.get_level(level).name
+            level_note = (
+                f"level {level} ({lvl_name})"
+                if lvl_name
+                else f"level {level}"
             )
+            if discovery.progressive_strictness and not discovery.use_custom:
+                level_note += f" · progressive (max {discovery.validation_level})"
+            if mode == "continuous":
+                agent_updates["message"] = (
+                    f"Submitted sweep — {plan.symbol} · {plan.timeframe} · "
+                    f"{level_note} · continuous (runs until Stop)"
+                )
+            else:
+                agent_updates["message"] = (
+                    f"Submitted sweep — {plan.symbol} · {plan.timeframe} · {level_note}"
+                )
+    agent_updates["bandit_stats"] = dump_bandit_stats(bandit)
+    agent_updates["heartbeat_at"] = time.time()
     storage.update_agent_state(**agent_updates)
-    _run_alert_pass(storage, cfg)
+    # Never block the 1s tick loop on SMTP / promotion scoring.
+    _schedule_alert_pass(storage, cfg)
+
+
+def _schedule_alert_pass(storage: Storage, cfg: dict) -> None:
+    """Fire-and-forget alert/promotion work so the tick loop stays snappy."""
+    global _ALERT_THREAD
+    if not _ALERT_LOCK.acquire(blocking=False):
+        return  # previous alert pass still running
+
+    def _run() -> None:
+        try:
+            _run_alert_pass(storage, cfg)
+        except Exception as exc:
+            log.warning("alert/promotion pass failed: %s", exc)
+        finally:
+            _ALERT_LOCK.release()
+
+    _ALERT_THREAD = threading.Thread(
+        target=_run, name="ea-alert-pass", daemon=True)
+    _ALERT_THREAD.start()
+
+
+def _update_bandit_from_finished_jobs(storage: Storage, state: dict,
+                                      bandit: dict) -> None:
+    """Credit Thompson arms when a sweep job finishes with survivors.
+
+    Soft-weights successes: +1 for any survivor, +2 when the job cleared
+    L4+ (or the job's validation floor) so productive niches get more pulls.
+    """
+    last_seen = str(state.get("last_bandit_learned_job") or "")
+    jobs = storage.list_jobs("discovery")
+    for job in jobs:
+        if job.id == last_seen:
+            break
+        if job.status.value not in ("DONE", "FAILED", "CANCELLED"):
+            continue
+        symbol = str(job.payload.get("symbol") or "").strip().upper()
+        timeframe = str(job.payload.get("timeframe") or "")
+        if not symbol or not timeframe:
+            continue
+        max_level = 0
+        try:
+            max_level = int(storage.job_max_level_passed(job.id) or 0)
+        except Exception:
+            max_level = 0
+        floor = int(
+            job.payload.get("validation_level_floor")
+            or job.payload.get("validation_level")
+            or 4
+        )
+        success, weight = outcome_weight(
+            survivors=int(job.survivors or 0) if job.status.value == "DONE" else 0,
+            max_level=max_level if job.status.value == "DONE" else 0,
+            floor_level=floor,
+        )
+        record_outcome(bandit, symbol, timeframe, success=success, weight=weight)
+        storage.update_agent_state(last_bandit_learned_job=job.id)
+        break
 
 
 def _run_alert_pass(storage: Storage, cfg: dict) -> None:
@@ -397,3 +622,4 @@ def _run_alert_pass(storage: Storage, cfg: dict) -> None:
         recipient=recipient,
         progress_email_hours=cfg["progress_email_hours"],
     )
+    maybe_send_ops_alerts(storage, recipient=recipient)

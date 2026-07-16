@@ -16,17 +16,19 @@ from factory.storage import Storage
 
 
 def _report(**overrides) -> ValidationReport:
+    # Metrics sized for edge_positive (~76): clears min_score=75 but stays
+    # below the 80 promote_live threshold so the min_score gate is meaningful.
     base = ValidationReport(
         strategy_id="s-alert",
         is_metrics=BacktestMetrics(),
         oos_metrics=BacktestMetrics(
             net_profit=1500.0,
-            profit_factor=1.6,
-            sharpe=1.2,
+            profit_factor=1.8,
+            sharpe=1.4,
             max_dd_pct=8.0,
-            trade_count=50,
+            trade_count=60,
         ),
-        wfe=0.75,
+        wfe=0.85,
         passed=True,
         stability_ratio=0.85,
     )
@@ -41,8 +43,12 @@ def temp_db(tmp_path: Path) -> Path:
 
 
 def test_is_exceptional_ea_requires_strong_promotion(temp_db: Path) -> None:
-    strong = evaluate_promotion(_report())
-    weak = evaluate_promotion(_report(oos_metrics=BacktestMetrics(net_profit=10.0, profit_factor=1.0, sharpe=0.1)))
+    strong = evaluate_promotion(
+        _report(), holdout_passed=True, mt5_confirmed=False)
+    weak = evaluate_promotion(
+        _report(oos_metrics=BacktestMetrics(net_profit=10.0, profit_factor=1.0, sharpe=0.1)),
+        holdout_passed=True,
+    )
     assert is_exceptional_ea(strong, min_score=75.0)
     assert not is_exceptional_ea(strong, min_score=85.0)
     assert not is_exceptional_ea(weak, min_score=75.0)
@@ -50,6 +56,15 @@ def test_is_exceptional_ea_requires_strong_promotion(temp_db: Path) -> None:
 
 def test_quality_alert_only_once_per_strategy(temp_db: Path, monkeypatch) -> None:
     storage = Storage(temp_db)
+
+    class _Holdout:
+        passed = True
+        error = None
+
+    monkeypatch.setattr(
+        "factory.holdout.evaluate_holdout",
+        lambda *a, **k: _Holdout(),
+    )
     strategy = StrategyDefinition(
         id="s-alert",
         symbol="EURUSD",
@@ -64,6 +79,8 @@ def test_quality_alert_only_once_per_strategy(temp_db: Path, monkeypatch) -> Non
         ),
     )
     report = _report()
+    report.holdout_passed = True
+    report.mt5_confirmed = False  # edge_positive, not watchlist
     storage.save_complete(strategy, report, job_id="job1")
 
     sent: list[tuple[str, str, str]] = []

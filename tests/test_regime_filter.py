@@ -173,7 +173,7 @@ def test_rendered_ea_contains_sizing_block():
     assert "Inp_X_regime_sizing            = 1;" in src
     assert "Inp_X_regime_size_quiet_trend  = 2;" in src
     assert "TM_RegimeLotMult" in src
-    assert "NormalizeLots(lots * TM_RegimeLotMult())" in src
+    assert "NormalizeLots(lots * TM_RegimeLotMult() * TM_HmmLotMult())" in src
     inputs, ranges = mql5_inputs_for(strat)
     assert inputs["Inp_X_regime_size_vol_range"] == 0.75
 

@@ -47,6 +47,7 @@ class ValidationSummary:
     strategy_id: str
     run_id: Optional[str] = None
     passed: bool = False
+    highest_level_passed: int = 0
     wfe: float = 0.0
     engine: str = "simulator"
     data_source: str = "unknown"
@@ -92,7 +93,9 @@ CREATE TABLE IF NOT EXISTS validations (
     hard_gates_passed INTEGER NOT NULL DEFAULT 0,
     quality_breakdown TEXT,
     last_alert_at REAL,
-    alert_fingerprint TEXT
+    alert_fingerprint TEXT,
+    highest_level_passed INTEGER NOT NULL DEFAULT 0,
+    infra_failure INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS jobs (
     id TEXT PRIMARY KEY,
@@ -159,9 +162,24 @@ CREATE TABLE IF NOT EXISTS strategy_metadata (
     parameter_snapshot TEXT,
     parent_id TEXT,
     generation INTEGER,
+    parents_json TEXT,
+    mutations_json TEXT,
+    operation TEXT,
+    pareto_rank REAL,
+    crowding_distance REAL,
     updated_at REAL
 );
 """
+
+# Columns added to strategy_metadata after it first shipped (lineage /
+# explainability). ALTER TABLE keeps pre-existing databases readable.
+_STRATEGY_METADATA_COLUMNS = (
+    ("parents_json", "TEXT"),
+    ("mutations_json", "TEXT"),
+    ("operation", "TEXT"),
+    ("pareto_rank", "REAL"),
+    ("crowding_distance", "REAL"),
+)
 
 # Columns added after the original jobs table shipped; carried live during a
 # run so the UI can show determinate progress. ALTER TABLE keeps pre-existing
@@ -177,6 +195,17 @@ _AGENT_STATE_COLUMNS = (
     ("mode", "TEXT NOT NULL DEFAULT 'continuous'"),
     ("spawn_attempts", "INTEGER NOT NULL DEFAULT 0"),
     ("last_promotion_sync_at", "REAL"),
+    ("effective_validation_level", "INTEGER"),
+    ("bandit_stats", "TEXT"),
+    ("last_bandit_job_id", "TEXT"),
+    ("last_bandit_learned_job", "TEXT"),
+    ("budget_seconds_used_today", "REAL NOT NULL DEFAULT 0"),
+    ("budget_day_utc", "TEXT"),
+    ("budget_paused_until", "REAL"),
+    ("last_watchdog_restart_at", "REAL"),
+    ("watchdog_restart_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("pending_watchdog_alert", "INTEGER NOT NULL DEFAULT 0"),
+    ("pending_mt5_disagree_alert", "TEXT"),
 )
 
 # Columns added to `validations` after it first shipped. `job_id` links every
@@ -190,12 +219,24 @@ _VALIDATION_COLUMNS = (
     ("quality_breakdown", "TEXT"),
     ("last_alert_at", "REAL"),
     ("alert_fingerprint", "TEXT"),
+    ("highest_level_passed", "INTEGER NOT NULL DEFAULT 0"),
+    # Indexed flag so KPIs can exclude incomplete MT5/infra aborts without
+    # scanning multi-GB validation body blobs.
+    ("infra_failure", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 # Indexes for gallery / per-run lookups. job_id is filtered on every
 # Results-per-run open; without it each COUNT/list scans the full body table.
 _VALIDATION_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_validations_job_id ON validations(job_id)",
+    "CREATE INDEX IF NOT EXISTS idx_validations_level "
+    "ON validations(highest_level_passed)",
+    # KPI strip GROUP BY — without this, SQLite full-scans the body blobs
+    # (~multi-GB) and the dashboard freezes after the hero for tens of seconds.
+    "CREATE INDEX IF NOT EXISTS idx_validations_promotion "
+    "ON validations(promotion_state)",
+    "CREATE INDEX IF NOT EXISTS idx_validations_infra "
+    "ON validations(infra_failure)",
 )
 
 
@@ -218,7 +259,10 @@ class Storage:
         self._migrate_job_extra_columns(con)
         self._migrate_validation_columns(con)
         self._migrate_validation_indexes(con)
+        self._migrate_infra_failure_backfill(con)
         self._migrate_agent_state_columns(con)
+        self._migrate_strategy_metadata_columns(con)
+        self._migrate_validation_level_schema(con)
 
     @staticmethod
     def _migrate_job_counters(con: sqlite3.Connection) -> None:
@@ -259,6 +303,48 @@ class Storage:
             con.execute(ddl)
 
     @staticmethod
+    def _migrate_infra_failure_backfill(con: sqlite3.Connection) -> None:
+        """One-shot: mark legacy INFRA rows so KPI counts stay honest.
+
+        Guarded by app_settings so the LIKE scan over body blobs runs once.
+        Best-effort: if the DB is locked by a live agent, skip and retry later.
+        """
+        if not Storage._table_exists(con, "validations"):
+            return
+        cols = {r["name"] for r in con.execute("PRAGMA table_info(validations)")}
+        if "infra_failure" not in cols:
+            return
+        try:
+            row = con.execute(
+                "SELECT value FROM app_settings WHERE key=?",
+                ("infra_failure_backfill_v2",),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return
+        if row is not None:
+            return
+        try:
+            con.execute(
+                "UPDATE validations SET infra_failure=1 "
+                "WHERE infra_failure=0 AND ("
+                "  body LIKE '%\"infra_failure\": true%' "
+                "  OR body LIKE '%\"infra_failure\":true%' "
+                "  OR body LIKE '%INFRA:%'"
+                "  OR body LIKE '%did not complete%'"
+                "  OR body LIKE '%already running interactively%'"
+                ")"
+            )
+            con.execute(
+                "INSERT OR REPLACE INTO app_settings (key, value, updated_at) "
+                "VALUES (?, ?, ?)",
+                ("infra_failure_backfill_v2", "1", time.time()),
+            )
+        except sqlite3.OperationalError:
+            # Live writer holds the DB — leave the sentinel unset so a later
+            # connection (dashboard/agent idle) can finish the backfill.
+            return
+
+    @staticmethod
     def _migrate_agent_state_columns(con: sqlite3.Connection) -> None:
         """Add live-status columns to agent_state created before they existed."""
         if not Storage._table_exists(con, "agent_state"):
@@ -267,6 +353,97 @@ class Storage:
         for col, decl in _AGENT_STATE_COLUMNS:
             if col not in existing:
                 con.execute(f"ALTER TABLE agent_state ADD COLUMN {col} {decl}")
+
+    @staticmethod
+    def _migrate_strategy_metadata_columns(con: sqlite3.Connection) -> None:
+        """Add lineage / explainability columns to strategy_metadata."""
+        if not Storage._table_exists(con, "strategy_metadata"):
+            return
+        existing = {
+            r["name"] for r in con.execute("PRAGMA table_info(strategy_metadata)")
+        }
+        for col, decl in _STRATEGY_METADATA_COLUMNS:
+            if col not in existing:
+                con.execute(
+                    f"ALTER TABLE strategy_metadata ADD COLUMN {col} {decl}")
+
+    @staticmethod
+    def _migrate_validation_level_schema(con: sqlite3.Connection) -> None:
+        """Lazy remap legacy L1–L6 ``highest_level_passed`` into fine L1–L16.
+
+        No re-backtest: values are remapped via ``LEGACY_LEVEL_MAP`` once the
+        stored schema version is below ``LEVEL_SCHEMA_VERSION``. Discovery
+        ceiling/start keys in ``app_settings`` are remapped the same way.
+        """
+        from factory import validation_levels
+
+        target = int(validation_levels.LEVEL_SCHEMA_VERSION)
+        row = con.execute(
+            "SELECT value FROM app_settings WHERE key=?",
+            ("validation_level_schema_version",),
+        ).fetchone()
+        current = 1
+        if row is not None:
+            try:
+                current = int(json.loads(row["value"]))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                try:
+                    current = int(row["value"])
+                except (TypeError, ValueError):
+                    current = 1
+        if current >= target:
+            return
+
+        if Storage._table_exists(con, "validations"):
+            cols = {r["name"] for r in con.execute(
+                "PRAGMA table_info(validations)")}
+            if "highest_level_passed" in cols:
+                # Single CASE update — sequential UPDATEs would collide
+                # (e.g. legacy 2→4 then legacy 4→10).
+                cases = " ".join(
+                    f"WHEN {legacy} THEN {fine}"
+                    for legacy, fine in sorted(
+                        validation_levels.LEGACY_LEVEL_MAP.items())
+                )
+                con.execute(
+                    "UPDATE validations SET highest_level_passed = CASE "
+                    f"highest_level_passed {cases} ELSE highest_level_passed END "
+                    "WHERE highest_level_passed BETWEEN 1 AND 6"
+                )
+
+        # Remap persisted discovery level dials that still use the coarse scale.
+        for key in (
+            "discovery_validation_level",
+            "discovery_validation_level_start",
+        ):
+            srow = con.execute(
+                "SELECT value FROM app_settings WHERE key=?", (key,)
+            ).fetchone()
+            if srow is None:
+                continue
+            try:
+                raw = json.loads(srow["value"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            try:
+                remapped = validation_levels.remap_legacy_level(
+                    int(raw), schema_version=current)
+            except (TypeError, ValueError):
+                continue
+            con.execute(
+                "UPDATE app_settings SET value=?, updated_at=? WHERE key=?",
+                (json.dumps(remapped), time.time(), key),
+            )
+
+        con.execute(
+            "INSERT OR REPLACE INTO app_settings (key, value, updated_at) "
+            "VALUES (?, ?, ?)",
+            (
+                "validation_level_schema_version",
+                json.dumps(target),
+                time.time(),
+            ),
+        )
 
     @staticmethod
     def _table_exists(con: sqlite3.Connection, name: str) -> bool:
@@ -325,17 +502,43 @@ class Storage:
                  strategy.created_at, body_s),
             )
             con.execute(
-                "INSERT OR REPLACE INTO validations (strategy_id, passed, wfe, body, updated_at, job_id)"
-                " VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO validations "
+                "(strategy_id, passed, wfe, body, updated_at, job_id, "
+                " highest_level_passed, infra_failure)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (report.strategy_id, int(report.passed), report.wfe, body_v, now,
-                 job_id),
+                 job_id, int(getattr(report, "highest_level_passed", 0) or 0),
+                 int(bool(getattr(report, "infra_failure", False)))),
             )
             if metadata:
+                lineage = strategy.lineage
+                parents = metadata.get("parents_json")
+                if parents is None:
+                    parents = list(lineage.parents or [])
+                mutations = metadata.get("mutations_json")
+                if mutations is None:
+                    mutations = list(lineage.mutations or [])
+                operation = metadata.get("operation")
+                if not operation:
+                    if len(parents) > 1:
+                        operation = "crossover"
+                    elif parents:
+                        operation = "mutate"
+                    else:
+                        operation = "random"
+                parent_id = metadata.get("parent_id")
+                if parent_id is None and parents:
+                    parent_id = parents[0]
+                generation = metadata.get("generation")
+                if generation is None:
+                    generation = lineage.generation
                 con.execute(
                     "INSERT OR REPLACE INTO strategy_metadata "
                     "(strategy_id, sweep_symbol, sweep_timeframe, strictness_profile, "
-                    " seed, parameter_snapshot, parent_id, generation, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " seed, parameter_snapshot, parent_id, generation, "
+                    " parents_json, mutations_json, operation, "
+                    " pareto_rank, crowding_distance, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         strategy.id,
                         metadata.get("sweep_symbol"),
@@ -343,8 +546,13 @@ class Storage:
                         metadata.get("strictness_profile"),
                         metadata.get("seed"),
                         json.dumps(metadata.get("parameter_snapshot", {})),
-                        metadata.get("parent_id"),
-                        metadata.get("generation"),
+                        parent_id,
+                        generation,
+                        json.dumps(parents),
+                        json.dumps(mutations),
+                        operation,
+                        metadata.get("pareto_rank"),
+                        metadata.get("crowding_distance"),
                         now,
                     ),
                 )
@@ -462,10 +670,14 @@ class Storage:
     def save_validation(self, report: ValidationReport) -> None:
         with self.connection() as con:
             con.execute(
-                "INSERT OR REPLACE INTO validations (strategy_id, passed, wfe, body, updated_at)"
-                " VALUES (?, ?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO validations "
+                "(strategy_id, passed, wfe, body, updated_at, highest_level_passed, "
+                " infra_failure)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (report.strategy_id, int(report.passed), report.wfe,
-                 report.model_dump_json(), time.time()),
+                 report.model_dump_json(), time.time(),
+                 int(getattr(report, "highest_level_passed", 0) or 0),
+                 int(bool(getattr(report, "infra_failure", False)))),
             )
 
     def get_validation(self, strategy_id: str) -> Optional[ValidationReport]:
@@ -493,10 +705,14 @@ class Storage:
         return {r["strategy_id"]: self._row_to_report(r) for r in rows}
 
     def list_validated(self, passed_only: bool = True,
-                       job_id: Optional[str] = None) -> List[ValidationReport]:
+                       job_id: Optional[str] = None,
+                       *,
+                       min_level: Optional[int] = None,
+                       limit: Optional[int] = None) -> List[ValidationReport]:
         q = (
             "SELECT body, job_id, promotion_state, quality_score, hard_gates_passed, "
-            "quality_breakdown, last_alert_at, alert_fingerprint FROM validations"
+            "quality_breakdown, last_alert_at, alert_fingerprint, "
+            "highest_level_passed FROM validations"
         )
         clauses, args = [], []
         if passed_only:
@@ -504,9 +720,15 @@ class Storage:
         if job_id is not None:
             clauses.append("job_id=?")
             args.append(job_id)
+        if min_level is not None:
+            clauses.append("highest_level_passed>=?")
+            args.append(int(min_level))
         if clauses:
             q += " WHERE " + " AND ".join(clauses)
-        q += " ORDER BY wfe DESC"
+        q += " ORDER BY highest_level_passed DESC, wfe DESC"
+        if limit is not None:
+            q += " LIMIT ?"
+            args.append(max(1, int(limit)))
         with self.connection() as con:
             rows = con.execute(q, tuple(args)).fetchall()
         return [self._row_to_report(r) for r in rows]
@@ -516,6 +738,7 @@ class Storage:
         passed_only: bool | None = True,
         job_id: Optional[str] = None,
         *,
+        min_level: Optional[int] = None,
         limit: Optional[int] = None,
         offset: int = 0,
         include_body_metrics: bool = True,
@@ -531,7 +754,7 @@ class Storage:
         if include_body_metrics:
             select = (
                 "SELECT strategy_id, passed, wfe, job_id, promotion_state, quality_score, "
-                "hard_gates_passed, "
+                "hard_gates_passed, highest_level_passed, "
                 "json_extract(body, '$.engine') AS engine, "
                 "json_extract(body, '$.data_source') AS data_source, "
                 "json_extract(body, '$.degradation_pct') AS degradation_pct, "
@@ -552,7 +775,7 @@ class Storage:
         else:
             select = (
                 "SELECT strategy_id, passed, wfe, job_id, promotion_state, quality_score, "
-                "hard_gates_passed FROM validations"
+                "hard_gates_passed, highest_level_passed FROM validations"
             )
         q = select
         clauses, args = [], []
@@ -563,9 +786,12 @@ class Storage:
         if job_id is not None:
             clauses.append("job_id=?")
             args.append(job_id)
+        if min_level is not None:
+            clauses.append("highest_level_passed>=?")
+            args.append(int(min_level))
         if clauses:
             q += " WHERE " + " AND ".join(clauses)
-        q += " ORDER BY wfe DESC"
+        q += " ORDER BY highest_level_passed DESC, wfe DESC"
         if limit is not None:
             q += " LIMIT ? OFFSET ?"
             args.extend([int(limit), int(offset)])
@@ -623,6 +849,10 @@ class Storage:
             strategy_id=row["strategy_id"],
             run_id=row["job_id"] if "job_id" in keys else None,
             passed=bool(row["passed"]),
+            highest_level_passed=(
+                int(row["highest_level_passed"] or 0)
+                if "highest_level_passed" in keys else 0
+            ),
             wfe=float(row["wfe"] or 0.0),
             engine=str(row["engine"] or "simulator") if "engine" in keys else "simulator",
             data_source=(
@@ -691,6 +921,26 @@ class Storage:
                 report.quality_breakdown = json.loads(row["quality_breakdown"])
             except json.JSONDecodeError:
                 report.quality_breakdown = {}
+        # Prefer the indexed column; fall back to body; recompute for legacy rows.
+        col_level = None
+        if "highest_level_passed" in keys and row["highest_level_passed"] is not None:
+            col_level = int(row["highest_level_passed"])
+        if col_level is not None and col_level > 0:
+            report.highest_level_passed = col_level
+        elif not report.highest_level_passed:
+            try:
+                from factory import validation_levels
+                honesty = validation_levels.HonestySignals(
+                    p_oos_loss=float(getattr(report, "p_oos_loss", 0.0) or 0.0),
+                    dsr=float(getattr(report, "dsr", 0.0) or 0.0),
+                    stability_ratio=float(
+                        getattr(report, "stability_ratio", 1.0) or 1.0),
+                )
+                report.highest_level_passed = validation_levels.highest_level_cleared(
+                    report.oos_metrics, report.wfe, report.montecarlo,
+                    honesty=honesty)
+            except Exception:
+                pass
         return report
 
     def get_strategy_metadata(self, strategy_id: str) -> Optional[dict]:
@@ -702,11 +952,17 @@ class Storage:
         if not row:
             return None
         out = dict(row)
-        if out.get("parameter_snapshot"):
+        for key in ("parameter_snapshot", "parents_json", "mutations_json"):
+            raw = out.get(key)
+            if not raw:
+                out[key] = {} if key == "parameter_snapshot" else []
+                continue
+            if isinstance(raw, (dict, list)):
+                continue
             try:
-                out["parameter_snapshot"] = json.loads(out["parameter_snapshot"])
-            except json.JSONDecodeError:
-                out["parameter_snapshot"] = {}
+                out[key] = json.loads(raw)
+            except (TypeError, json.JSONDecodeError):
+                out[key] = {} if key == "parameter_snapshot" else []
         return out
 
     def update_validation_promotion(
@@ -759,14 +1015,19 @@ class Storage:
         job_id: Optional[str] = None,
         *,
         passed_only: bool | None = None,
+        min_level: Optional[int] = None,
+        exclude_infra: bool = False,
     ) -> tuple[int, int] | int:
         """Count validations.
 
         - ``count_validated(job_id)`` → ``(passed, total)`` for one run (legacy).
         - ``count_validated(passed_only=True|False|None)`` → single COUNT(*) for
           the library (``None`` = all rows).
+        - ``min_level`` restricts to ``highest_level_passed >= min_level``.
+        - ``exclude_infra`` drops incomplete MT5/infra aborts from the total.
         """
-        if job_id is not None and passed_only is None:
+        if (job_id is not None and passed_only is None and min_level is None
+                and not exclude_infra):
             with self.connection() as con:
                 row = con.execute(
                     "SELECT COALESCE(SUM(passed), 0) AS passed, COUNT(*) AS total"
@@ -781,12 +1042,163 @@ class Storage:
             clauses.append("passed=1")
         elif passed_only is False:
             clauses.append("passed=0")
+        if min_level is not None:
+            clauses.append("highest_level_passed>=?")
+            args.append(int(min_level))
+        if exclude_infra:
+            clauses.append("COALESCE(infra_failure, 0)=0")
         q = "SELECT COUNT(*) AS n FROM validations"
         if clauses:
             q += " WHERE " + " AND ".join(clauses)
         with self.connection() as con:
             row = con.execute(q, tuple(args)).fetchone()
         return int(row["n"]) if row else 0
+
+    def count_infra_failures(self, job_id: Optional[str] = None) -> int:
+        """Count validations tagged as infrastructure / incomplete aborts."""
+        if job_id is not None:
+            with self.connection() as con:
+                row = con.execute(
+                    "SELECT COUNT(*) AS n FROM validations "
+                    "WHERE job_id=? AND COALESCE(infra_failure, 0)=1",
+                    (job_id,),
+                ).fetchone()
+            return int(row["n"]) if row else 0
+        with self.connection() as con:
+            row = con.execute(
+                "SELECT COUNT(*) AS n FROM validations "
+                "WHERE COALESCE(infra_failure, 0)=1"
+            ).fetchone()
+        return int(row["n"]) if row else 0
+
+    def list_cleared_strategies(
+        self,
+        *,
+        symbol: Optional[str] = None,
+        timeframe: Optional[str] = None,
+        symbol_class: Optional[str] = None,
+        min_level: int = 4,
+        limit: int = 20,
+    ) -> List[StrategyDefinition]:
+        """Strategies that cleared ``min_level`` (for elite seeding / bias).
+
+        ``symbol_class`` (e.g. ``\"fx\"``) filters after load via
+        :func:`factory.symbol_class.classify_symbol` so elites can transfer
+        across instruments in the same economics class.
+        """
+        clauses = ["v.highest_level_passed >= ?", "COALESCE(v.infra_failure, 0)=0"]
+        args: list = [int(min_level)]
+        if symbol:
+            clauses.append("s.symbol=?")
+            args.append(symbol)
+        if timeframe:
+            clauses.append("s.timeframe=?")
+            args.append(timeframe)
+        # Over-fetch when class-filtering without an exact symbol match.
+        fetch_limit = int(limit) * 5 if (symbol_class and not symbol) else int(limit)
+        args.append(fetch_limit)
+        q = (
+            "SELECT s.body FROM validations v "
+            "JOIN strategies s ON s.id = v.strategy_id "
+            f"WHERE {' AND '.join(clauses)} "
+            "ORDER BY v.highest_level_passed DESC, v.quality_score DESC "
+            "LIMIT ?"
+        )
+        out: List[StrategyDefinition] = []
+        with self.connection() as con:
+            rows = con.execute(q, tuple(args)).fetchall()
+        want_class = (symbol_class or "").strip().lower()
+        if want_class:
+            from factory.symbol_class import classify_symbol
+        for row in rows:
+            try:
+                strat = StrategyDefinition.model_validate_json(row["body"])
+            except Exception:
+                continue
+            if want_class:
+                if classify_symbol(strat.symbol).value != want_class:
+                    continue
+            out.append(strat)
+            if len(out) >= int(limit):
+                break
+        return out
+
+    def mechanic_clear_counts(
+        self, *, min_level: int = 4,
+    ) -> Dict[str, int]:
+        """Mechanic type → count among cleared (non-infra) validations."""
+        counts: Dict[str, int] = {}
+        for strat in self._iter_cleared_strategies(min_level=min_level):
+            key = strat.mechanic.type.value
+            counts[key] = counts.get(key, 0) + 1
+        return counts
+
+    def family_clear_counts(
+        self, *, min_level: int = 4,
+    ) -> Dict[str, int]:
+        """Hypothesis family name → count among cleared validations."""
+        from factory.symbol_class import infer_hypothesis_family
+
+        counts: Dict[str, int] = {}
+        for strat in self._iter_cleared_strategies(min_level=min_level):
+            fam = infer_hypothesis_family(
+                f.type.value for f in strat.entry_filters)
+            if not fam:
+                continue
+            counts[fam] = counts.get(fam, 0) + 1
+        return counts
+
+    def filter_clear_counts(
+        self, *, min_level: int = 4,
+    ) -> Dict[str, int]:
+        """Entry filter type value → count among cleared validations."""
+        counts: Dict[str, int] = {}
+        for strat in self._iter_cleared_strategies(min_level=min_level):
+            for f in strat.entry_filters:
+                key = f.type.value
+                counts[key] = counts.get(key, 0) + 1
+        return counts
+
+    def _iter_cleared_strategies(
+        self, *, min_level: int = 4,
+    ) -> Iterator[StrategyDefinition]:
+        """Yield strategies that cleared ``min_level`` (non-infra)."""
+        q = (
+            "SELECT s.body FROM validations v "
+            "JOIN strategies s ON s.id = v.strategy_id "
+            "WHERE v.highest_level_passed >= ? AND COALESCE(v.infra_failure, 0)=0"
+        )
+        with self.connection() as con:
+            rows = con.execute(q, (int(min_level),)).fetchall()
+        for row in rows:
+            try:
+                yield StrategyDefinition.model_validate_json(row["body"])
+            except Exception:
+                continue
+
+    def job_max_level_passed(self, job_id: str) -> int:
+        """Highest ``highest_level_passed`` among validations for ``job_id``."""
+        with self.connection() as con:
+            row = con.execute(
+                "SELECT COALESCE(MAX(highest_level_passed), 0) AS m "
+                "FROM validations WHERE job_id=?",
+                (job_id,),
+            ).fetchone()
+        return int(row["m"] if row else 0)
+
+    def level_counts(self, job_id: Optional[str] = None) -> Dict[int, int]:
+        """Row counts keyed by ``highest_level_passed`` (population histogram)."""
+        q = (
+            "SELECT highest_level_passed AS lvl, COUNT(*) AS n FROM validations"
+        )
+        args: list = []
+        if job_id is not None:
+            q += " WHERE job_id=?"
+            args.append(job_id)
+        q += " GROUP BY highest_level_passed"
+        with self.connection() as con:
+            rows = con.execute(q, tuple(args)).fetchall()
+        return {int(r["lvl"] or 0): int(r["n"]) for r in rows}
 
     def promotion_state_counts(self) -> Dict[str, int]:
         """Row counts per promotion_state (single GROUP BY, KPI strip)."""
@@ -813,6 +1225,57 @@ class Storage:
         out = {jid: (0, 0) for jid in ids}
         for row in rows:
             out[str(row["job_id"])] = (int(row["passed"]), int(row["total"]))
+        return out
+
+    def run_progress_by_jobs(
+        self,
+        job_ids: Sequence[str],
+        *,
+        max_level: int = 16,
+    ) -> Dict[str, dict]:
+        """Per-run validation progress: total tested, floor passes, and L1+…Ln+ counts.
+
+        One GROUP BY query — safe to call for every run on the dashboard.
+        """
+        ids = [jid for jid in job_ids if jid]
+        empty = {
+            "total": 0,
+            "tradeable": 0,
+            "infra": 0,
+            "passed": 0,
+            "level_passes": {lvl: 0 for lvl in range(1, max_level + 1)},
+        }
+        if not ids:
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        level_cases = ", ".join(
+            f"SUM(CASE WHEN highest_level_passed >= {lvl} THEN 1 ELSE 0 END) AS l{lvl}"
+            for lvl in range(1, max_level + 1)
+        )
+        q = (
+            f"SELECT job_id, COUNT(*) AS total, "
+            f"SUM(CASE WHEN COALESCE(infra_failure, 0)=0 THEN 1 ELSE 0 END) AS tradeable, "
+            f"SUM(CASE WHEN COALESCE(infra_failure, 0)=1 THEN 1 ELSE 0 END) AS infra, "
+            f"COALESCE(SUM(passed), 0) AS passed, "
+            f"{level_cases} "
+            f"FROM validations WHERE job_id IN ({placeholders}) GROUP BY job_id"
+        )
+        out = {jid: dict(empty) for jid in ids}
+        with self.connection() as con:
+            rows = con.execute(q, tuple(ids)).fetchall()
+        for row in rows:
+            jid = str(row["job_id"])
+            level_passes = {
+                lvl: int(row[f"l{lvl}"] or 0)
+                for lvl in range(1, max_level + 1)
+            }
+            out[jid] = {
+                "total": int(row["total"] or 0),
+                "tradeable": int(row["tradeable"] or 0),
+                "infra": int(row["infra"] or 0),
+                "passed": int(row["passed"] or 0),
+                "level_passes": level_passes,
+            }
         return out
 
     def list_unalerted_quality_candidates(

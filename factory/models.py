@@ -54,12 +54,14 @@ class StopLossMode(str, Enum):
     OFF = "OFF"          # no protective stop
     FIXED = "FIXED"      # fixed distance in points (mechanic sl_points)
     ATR = "ATR"          # adaptive: distance = ATR(period) * multiplier
+    PERCENT = "PERCENT"  # distance = entry_price * (sl_pct / 100)
 
 
 class TakeProfitMode(str, Enum):
     OFF = "OFF"          # no fixed target (rely on trailing / mechanic exits)
     FIXED = "FIXED"      # fixed distance in points (mechanic tp_points)
     RR = "RR"            # target = risk_reward * initial stop distance
+    PERCENT = "PERCENT"  # distance = entry_price * (tp_pct / 100)
 
 
 class TrailMode(str, Enum):
@@ -116,12 +118,15 @@ class TradeManagement(BaseModel):
     features are populated, so a simple strategy stays cheap to optimize.
 
     Parameter keys used in ``params`` (all in points unless noted):
-      atr_period, atr_sl_mult, tp_rr, trail_start_points, trail_distance_points,
+      atr_period, atr_sl_mult, tp_rr, sl_pct (%), tp_pct (%),
+      trail_start_points, trail_distance_points,
       trail_atr_mult, chandelier_lookback, trail_step_points, be_trigger_points,
       be_offset_points, risk_percent (%), start_hour, end_hour,
       max_trades_per_day, daily_loss_pct (%), cooldown_bars,
       regime_allow_mask (bitmask over regime codes 0..3), regime_adx_period,
-      regime_adx_min, regime_atr_period, regime_atr_mult.
+      regime_adx_min, regime_atr_period, regime_atr_mult,
+      hmm_mu0/1, hmm_sigma0/1, hmm_p00/11, hmm_pi0, hmm_min_prob,
+      hmm_allow_mask (bits over HMM states 0..1), hmm_size_state0/1.
     """
     sl_mode: StopLossMode = StopLossMode.FIXED
     tp_mode: TakeProfitMode = TakeProfitMode.FIXED
@@ -143,6 +148,11 @@ class TradeManagement(BaseModel):
     # regime_size_vol_trend). Shares the classification thresholds with the
     # regime filter.
     regime_sizing: bool = False
+    # Causal 2-state Gaussian HMM on log returns (see factory/hmm_regime.py).
+    # Filter gates entries by state bitmask + posterior confidence; sizing
+    # scales lots per latent state. Parameters are optimizable EA inputs.
+    hmm_regime_filter: bool = False
+    hmm_regime_sizing: bool = False
     params: Dict[str, float] = Field(default_factory=dict)
     ranges: Dict[str, "ParamRange"] = Field(default_factory=dict)
 
@@ -150,11 +160,23 @@ class TradeManagement(BaseModel):
         return (self.sl_mode == StopLossMode.ATR
                 or self.trail_mode in (TrailMode.ATR, TrailMode.CHANDELIER))
 
+    def uses_percent(self) -> bool:
+        return (self.sl_mode == StopLossMode.PERCENT
+                or self.tp_mode == TakeProfitMode.PERCENT)
+
+    def uses_dynamic_stops(self) -> bool:
+        """True when stop distance depends on price/ATR at entry (not FIXED)."""
+        return self.uses_atr() or self.uses_percent()
+
 
 class Lineage(BaseModel):
     parents: List[str] = Field(default_factory=list)
     mutations: List[str] = Field(default_factory=list)
     generation: int = 0
+    # Edge-first discovery: "edge" = signal probe; "execution" = mechanic variant
+    # that reuses a validated edge's entries. Empty = legacy / unmarked.
+    role: str = ""
+    edge_id: Optional[str] = None
 
 
 class StrategyProfile(BaseModel):
@@ -166,6 +188,8 @@ class StrategyProfile(BaseModel):
     mtf_context: bool = False
     feature_toggles: List[str] = Field(default_factory=list)
     portfolio_signature: str = ""
+    # "edge" | "execution" | "" — mirrors lineage.role for gallery filters.
+    search_phase: str = ""
 
 
 class StrategyDefinition(BaseModel):
@@ -212,7 +236,13 @@ class StrategyDefinition(BaseModel):
         return out
 
     def apply_flat_params(self, flat: Dict[str, float]) -> "StrategyDefinition":
-        """Return a copy with the flat (prefixed) parameter overrides applied."""
+        """Return a copy with the flat (prefixed) parameter overrides applied.
+
+        Point-distance ``base`` + ``*_scale`` search dims are collapsed onto
+        the original keys here so simulator / MQL5 never see scale params.
+        """
+        from factory.param_scale import collapse_scaled_point_params
+
         clone = self.model_copy(deep=True)
         for i, f in enumerate(clone.entry_filters):
             prefix = f"F{i}_{f.type.value}_"
@@ -226,7 +256,7 @@ class StrategyDefinition(BaseModel):
         for key, val in flat.items():
             if key.startswith("X_"):
                 clone.trade_mgmt.params[key[2:]] = val
-        return clone
+        return collapse_scaled_point_params(clone)
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +276,11 @@ class BacktestMetrics(BaseModel):
     trade_count: int = 0
     r_squared: float = 0.0             # linearity/stability of the equity curve
     max_consecutive_losses: int = 0
+    # Edge diagnostics (win rate vs realized R:R / expectancy).
+    win_rate: float = 0.0              # fraction of winning trades (0..1)
+    avg_win: float = 0.0               # mean profit of winners
+    avg_loss: float = 0.0              # mean |loss| of losers
+    expectancy: float = 0.0            # mean profit per trade
     initial_deposit: float = 0.0
     start_ts: float = 0.0              # unix seconds
     end_ts: float = 0.0
@@ -268,7 +303,8 @@ class AcceptanceCriteria(BaseModel):
     """User-configurable pass/fail gates applied to the OOS backtest zone.
 
     A value of 0 (or 0.0) disables the corresponding gate, except
-    ``min_wfe`` / ``max_dd_pct`` / ``min_trades`` which are always active.
+    ``max_dd_pct`` / ``min_trades`` which are always active.
+    ``min_wfe <= 0`` disables the WFE gate (L1 OOS screener).
     Mirrors EA Studio's Acceptance Criteria metric family.
     """
     min_wfe: float = 0.55
@@ -287,7 +323,7 @@ class AcceptanceCriteria(BaseModel):
     def evaluate(self, oos: "BacktestMetrics", wfe: float) -> List[str]:
         """Return the list of failed-gate reasons (empty == all gates pass)."""
         reasons: List[str] = []
-        if wfe <= self.min_wfe:
+        if self.min_wfe > 0 and wfe <= self.min_wfe:
             reasons.append(f"WFE {wfe:.3f} <= threshold {self.min_wfe}")
         if oos.max_dd_pct >= self.max_dd_pct:
             reasons.append(
@@ -383,7 +419,20 @@ class ValidationReport(BaseModel):
     wfo_windows: List[WFOWindowResult] = Field(default_factory=list)
     wfe: float = 0.0
     passed: bool = False
+    # Highest named validation level cleared (0 = none, 1..16 = Screener·A..Elite·B).
+    # Population browsing filters on this instead of a single boolean gate.
+    highest_level_passed: int = 0
+    # True when the highest cleared Screener level relied on soft-WFE waiver
+    # (triage-only — not a hard validated edge).
+    soft_wfe_clear: bool = False
+    # Explicit L1–L16 pass/fail after one backtest (keys are level number strings).
+    levels_cleared: Dict[str, bool] = Field(default_factory=dict)
+    # Wall-clock milliseconds for the Stage-2 validation pipeline.
+    duration_ms: float = 0.0
     reasons: List[str] = Field(default_factory=list)
+    # True when Stage-2 aborted due to infrastructure (MT5 busy, etc.), not
+    # strategy quality. Reasons for infra aborts are prefixed with ``INFRA:``.
+    infra_failure: bool = False
     best_params: Dict[str, float] = Field(default_factory=dict)
     engine: str = "simulator"
     is_range: Tuple[float, float] = (0.0, 0.0)   # unix ts of IS region
@@ -411,6 +460,10 @@ class ValidationReport(BaseModel):
     # multiple-testing haircut; <= ~0.5 = plausibly pure selection luck.
     dsr: float = 0.0
     n_trials: int = 1                  # candidates tried in the run so far
+    # Inner IS Optuna trial count (explainability; not folded into DSR).
+    is_trials: int = 0
+    # Top Optuna trials near best_params: [{params, value}, ...]
+    param_search_trace: List[Dict] = Field(default_factory=list)
     # Fraction of walk-forward OOS windows that ended unprofitable.
     p_oos_loss: float = 0.0
     # Per-regime OOS performance breakdown (see factory/regime.py).
@@ -419,6 +472,10 @@ class ValidationReport(BaseModel):
     promotion_state: str = "candidate"
     # Hard-gate flag for alert eligibility (strict minimum safety gates).
     hard_gates_passed: bool = False
+    # One-shot untouched-holdout result (None = not evaluated yet).
+    holdout_passed: Optional[bool] = None
+    # True when a post-sim MT5 confirmation pass agreed with the survivor.
+    mt5_confirmed: Optional[bool] = None
 
 
 # ---------------------------------------------------------------------------

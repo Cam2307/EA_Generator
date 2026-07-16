@@ -28,6 +28,14 @@ def test_wfe_gate():
     assert any("WFE" in r for r in reasons)
 
 
+def test_min_wfe_zero_disables_wfe_gate():
+    """min_wfe <= 0 skips WFE entirely (L1 OOS screener)."""
+    c = AcceptanceCriteria(min_wfe=0.0, max_dd_pct=70.0, min_trades=3,
+                           min_profit_factor=0.95)
+    assert c.evaluate(_oos(max_dd_pct=20.0, trade_count=10), wfe=0.0) == []
+    assert c.evaluate(_oos(max_dd_pct=20.0, trade_count=10), wfe=-1.0) == []
+
+
 def test_profit_factor_gate():
     c = AcceptanceCriteria(min_profit_factor=2.0)
     reasons = c.evaluate(_oos(profit_factor=1.1), wfe=1.0)

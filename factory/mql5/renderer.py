@@ -27,6 +27,7 @@ TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 # so the generated EA still declares every input with a sane (no-op) value.
 _TM_NEUTRAL: Dict[str, float] = {
     "atr_period": 14, "atr_sl_mult": 2.0, "tp_rr": 2.0,
+    "sl_pct": 1.0, "tp_pct": 1.5,
     "trail_start_points": 300, "trail_distance_points": 300,
     "trail_atr_mult": 3.0, "chandelier_lookback": 22, "trail_step_points": 10,
     "be_trigger_points": 300, "be_offset_points": 0, "risk_percent": 1.0,
@@ -36,9 +37,20 @@ _TM_NEUTRAL: Dict[str, float] = {
     "regime_atr_period": 14, "regime_atr_mult": 1.25,
     "regime_size_quiet_range": 1.0, "regime_size_quiet_trend": 1.0,
     "regime_size_vol_range": 1.0, "regime_size_vol_trend": 1.0,
+    "hmm_mu0": 0.0, "hmm_mu1": 0.0,
+    "hmm_sigma0": 0.0005, "hmm_sigma1": 0.002,
+    "hmm_p00": 0.95, "hmm_p11": 0.90, "hmm_pi0": 0.5,
+    "hmm_min_prob": 0.55, "hmm_allow_mask": 3,
+    "hmm_size_state0": 1.0, "hmm_size_state1": 1.0,
 }
-_SL_MODE_INT = {StopLossMode.OFF: 0, StopLossMode.FIXED: 1, StopLossMode.ATR: 2}
-_TP_MODE_INT = {TakeProfitMode.OFF: 0, TakeProfitMode.FIXED: 1, TakeProfitMode.RR: 2}
+_SL_MODE_INT = {
+    StopLossMode.OFF: 0, StopLossMode.FIXED: 1,
+    StopLossMode.ATR: 2, StopLossMode.PERCENT: 3,
+}
+_TP_MODE_INT = {
+    TakeProfitMode.OFF: 0, TakeProfitMode.FIXED: 1,
+    TakeProfitMode.RR: 2, TakeProfitMode.PERCENT: 3,
+}
 _TRAIL_MODE_INT = {TrailMode.OFF: 0, TrailMode.FIXED: 1, TrailMode.ATR: 2,
                    TrailMode.CHANDELIER: 3}
 _LOT_MODE_INT = {LotMode.FIXED: 0, LotMode.RISK_PERCENT: 1}
@@ -122,8 +134,10 @@ def _tm_replacements(tm: TradeManagement) -> Dict[str, str]:
         "__TM_SL_MODE__": str(_SL_MODE_INT[tm.sl_mode]),
         "__TM_ATR_PERIOD__": val("atr_period"),
         "__TM_ATR_SL_MULT__": val("atr_sl_mult"),
+        "__TM_SL_PCT__": val("sl_pct"),
         "__TM_TP_MODE__": str(_TP_MODE_INT[tm.tp_mode]),
         "__TM_TP_RR__": val("tp_rr"),
+        "__TM_TP_PCT__": val("tp_pct"),
         "__TM_TRAIL_MODE__": str(_TRAIL_MODE_INT[tm.trail_mode]),
         "__TM_TRAIL_START__": val("trail_start_points"),
         "__TM_TRAIL_DIST__": val("trail_distance_points"),
@@ -155,6 +169,19 @@ def _tm_replacements(tm: TradeManagement) -> Dict[str, str]:
         "__TM_RS_QT__": val("regime_size_quiet_trend"),
         "__TM_RS_VR__": val("regime_size_vol_range"),
         "__TM_RS_VT__": val("regime_size_vol_trend"),
+        "__TM_HMM_FILTER__": "1" if tm.hmm_regime_filter else "0",
+        "__TM_HMM_SIZING__": "1" if tm.hmm_regime_sizing else "0",
+        "__TM_HMM_MU0__": val("hmm_mu0"),
+        "__TM_HMM_MU1__": val("hmm_mu1"),
+        "__TM_HMM_SIG0__": val("hmm_sigma0"),
+        "__TM_HMM_SIG1__": val("hmm_sigma1"),
+        "__TM_HMM_P00__": val("hmm_p00"),
+        "__TM_HMM_P11__": val("hmm_p11"),
+        "__TM_HMM_PI0__": val("hmm_pi0"),
+        "__TM_HMM_MIN_P__": val("hmm_min_prob"),
+        "__TM_HMM_MASK__": val("hmm_allow_mask"),
+        "__TM_HMM_SZ0__": val("hmm_size_state0"),
+        "__TM_HMM_SZ1__": val("hmm_size_state1"),
     }
 
 
@@ -188,6 +215,8 @@ def _min_bars(strategy: StrategyDefinition) -> int:
         # 100-bar ATR baseline + ADX warmup for the regime classifier
         adx_p = int(tm.params.get("regime_adx_period", 14))
         needed = max(needed, 100 + adx_p * 3)
+    if tm.hmm_regime_filter or tm.hmm_regime_sizing:
+        needed = max(needed, 50)
     return needed + 10
 
 
@@ -197,6 +226,11 @@ def _sanitize_name(name: str) -> str:
 
 def render_ea(strategy: StrategyDefinition) -> str:
     """Render the complete .mq5 source for a strategy."""
+    from factory.param_scale import collapse_scaled_point_params, is_scale_key
+
+    # Mutate/genetic paths may leave *_scale in params; collapse first so
+    # templates only bake effective point distances on existing Inp_* keys.
+    strategy = collapse_scaled_point_params(strategy)
     base = (TEMPLATES_DIR / "base.mq5").read_text(encoding="utf-8")
 
     input_blocks: List[str] = []
@@ -225,7 +259,17 @@ def render_ea(strategy: StrategyDefinition) -> str:
 
     mech = strategy.mechanic
     msections = _load_sections(_MECHANIC_TEMPLATE_FILES[mech.type])
-    msub = lambda key: _substitute(msections.get(key, ""), 0, mech.params, "M")
+    # Fill missing mechanic params from the generator specs so older
+    # strategies (e.g. DCA without basket_sl_points) still render cleanly.
+    # Skip Optuna-only *_scale dims — they are not MQL5 inputs.
+    from factory.generator import MECHANIC_PARAM_SPECS
+    mech_params = dict(mech.params)
+    for name, pr in MECHANIC_PARAM_SPECS.get(mech.type, {}).items():
+        if is_scale_key(name) or name in mech_params:
+            continue
+        mid = pr.min + round(((pr.max - pr.min) / 2) / pr.step) * pr.step
+        mech_params[name] = float(pr.clamp(mid))
+    msub = lambda key: _substitute(msections.get(key, ""), 0, mech_params, "M")
     if msections.get("INPUTS"):
         input_blocks.append(msub("INPUTS"))
     if msections.get("GLOBALS"):
@@ -279,9 +323,17 @@ def mql5_inputs_for(strategy: StrategyDefinition):
     Returns ``(inputs, ranges)`` where keys are MQL5 input variable names,
     ready for [TesterInputs] blocks and .set export — including the execution
     mechanic parameters, which are optimizable exactly like filter parameters.
+
+    Optuna-only ``*_scale`` dims are omitted (EA has no matching inputs).
     """
+    from factory.param_scale import collapse_scaled_point_params
+
+    strategy = collapse_scaled_point_params(strategy)
     inputs = {mql5_input_name(k): v for k, v in strategy.all_params().items()}
-    ranges = {mql5_input_name(k): r for k, r in strategy.all_ranges().items()}
+    ranges = {
+        mql5_input_name(k): r for k, r in strategy.all_ranges().items()
+        if not mql5_input_name(k).endswith("_scale")
+    }
     return inputs, ranges
 
 

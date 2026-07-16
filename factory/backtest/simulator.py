@@ -11,6 +11,7 @@ real MT5 Strategy Tester run before export (see README).
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable, Dict, List, Mapping, Optional, Tuple
@@ -25,6 +26,8 @@ from factory.models import (
     LotMode, StopLossMode, StrategyDefinition, TakeProfitMode, TrailMode,
 )
 
+log = logging.getLogger(__name__)
+
 # Cooperative cancellation probe (see factory.backtest.validation). Checked
 # periodically inside the bar loop so even a single long backtest aborts
 # promptly instead of running to completion after a cancel.
@@ -33,6 +36,9 @@ CancelCheck = Optional[Callable[[], bool]]
 # How often (in bars) the bar loop polls the cancel probe. The probe itself is
 # throttled upstream, so this is just a cheap "am I still wanted?" heartbeat.
 _CANCEL_CHECK_EVERY_BARS = 4096
+
+# Log Numba→Python fallback at most once per process to avoid spam.
+_NUMBA_FALLBACK_LOGGED = False
 
 
 # ---------------------------------------------------------------------------
@@ -51,11 +57,41 @@ class SymbolSpec:
     # by default when the spec is inferred from data; tests that build a
     # spec directly keep the flat static costs.
     dynamic_costs: bool = False
+    # When True, raw contract PnL is in the quote currency (e.g. JPY on
+    # USDJPY) and must be divided by mark price to express USD-account PnL
+    # / margin. EURUSD-style quote=account pairs leave this False.
+    pnl_divide_by_price: bool = False
 
     @property
     def point_value(self) -> float:
-        """Account-currency value of one point for 1.0 lot."""
+        """Undiscounted tick value (``contract_size * point``).
+
+        For ``pnl_divide_by_price`` instruments use :meth:`point_value_at`
+        with a live mark so the value is in account currency.
+        """
         return self.contract_size * self.point
+
+    def point_value_at(self, mark_price: float) -> float:
+        """Account-currency value of one point for 1.0 lot at ``mark_price``."""
+        raw = self.contract_size * self.point
+        if self.pnl_divide_by_price and mark_price > 0.0:
+            return raw / mark_price
+        return raw
+
+    def price_move_pnl(self, price_diff: float, lots: float,
+                       mark_price: float) -> float:
+        """Account-currency PnL for a raw price change on ``lots``."""
+        raw = price_diff * self.contract_size * lots
+        if self.pnl_divide_by_price and mark_price > 0.0:
+            return raw / mark_price
+        return raw
+
+    def margin_for(self, lots: float, mark_price: float) -> float:
+        """Margin required to hold ``lots`` at ``mark_price``."""
+        if self.pnl_divide_by_price:
+            # Base-currency notional (USDJPY on a USD account).
+            return lots * self.contract_size / self.leverage
+        return lots * self.contract_size * mark_price / self.leverage
 
     # Account/execution economics a user may override from the UI. ``point``
     # is deliberately excluded: it is a property of the price scale and is
@@ -63,22 +99,121 @@ class SymbolSpec:
     OVERRIDABLE = ("contract_size", "leverage", "spread_points",
                    "slippage_points")
 
+    # Typical retail CFD / FX London-session base spreads (in *points* of the
+    # instrument's ``point`` size) and contract sizes. Broker specs vary;
+    # these are sane simulator defaults so multi-symbol discovery does not
+    # apply EURUSD 100k economics to gold/indices/crypto.
+    _INDEX_SPECS = {
+        "US30": (0.1, 1.0, 30.0),
+        "DJ30": (0.1, 1.0, 30.0),
+        "US500": (0.1, 1.0, 20.0),
+        "SPX500": (0.1, 1.0, 20.0),
+        "USTEC": (0.1, 1.0, 25.0),
+        "NAS100": (0.1, 1.0, 25.0),
+        "NASDAQ": (0.1, 1.0, 25.0),
+        "GER40": (0.1, 1.0, 25.0),
+        "DE40": (0.1, 1.0, 25.0),
+        "UK100": (0.1, 1.0, 25.0),
+        "FTSE": (0.1, 1.0, 25.0),
+        "JP225": (1.0, 100.0, 20.0),
+        "JPN225": (1.0, 100.0, 20.0),
+        "NI225": (1.0, 100.0, 20.0),
+    }
+    _FX_MAJORS = frozenset({
+        "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "USDCAD", "AUDUSD", "NZDUSD",
+    })
+
+    @staticmethod
+    def normalize_symbol(symbol: Optional[str]) -> str:
+        return (symbol or "").upper().replace(".", "").replace(
+            " ", "").replace("_", "")
+
+    @classmethod
+    def defaults_for_symbol(cls, symbol: Optional[str],
+                            price: float = 0.0) -> "SymbolSpec":
+        """Contract size, spread, slippage, and point scale for ``symbol``.
+
+        Symbol identity wins over raw price bands (so USDJPY ≠ gold, and
+        US30 ≠ XAUUSD). ``price`` is only a fallback when the symbol is
+        unknown / empty. Spread/slippage are typical London-session figures
+        used when auto symbol economics is enabled.
+        """
+        sym = cls.normalize_symbol(symbol)
+
+        if sym.startswith("XAU") or "GOLD" in sym:
+            return cls(point=0.01, contract_size=100.0,
+                       spread_points=25.0, slippage_points=5.0)
+        if sym.startswith("XAG") or "SILVER" in sym:
+            return cls(point=0.001, contract_size=5000.0,
+                       spread_points=30.0, slippage_points=6.0)
+
+        if sym in cls._INDEX_SPECS:
+            point, contract, spread = cls._INDEX_SPECS[sym]
+            return cls(point=point, contract_size=contract,
+                       spread_points=spread, slippage_points=4.0)
+
+        if (sym in ("USOIL", "UKOIL", "WTI", "BRENT", "XTIUSD", "XBRUSD")
+                or "OIL" in sym):
+            return cls(point=0.01, contract_size=100.0,
+                       spread_points=30.0, slippage_points=5.0)
+
+        if sym.startswith("BTC") or sym in ("XBTUSD",):
+            return cls(point=0.01, contract_size=1.0,
+                       spread_points=500.0, slippage_points=80.0)
+        if sym.startswith("ETH"):
+            return cls(point=0.01, contract_size=1.0,
+                       spread_points=200.0, slippage_points=40.0)
+
+        # FX: prefer 6-letter currency pairs (ignore broker suffixes already
+        # stripped by normalize_symbol).
+        fx_root = sym[:6] if len(sym) >= 6 else sym
+        if len(fx_root) == 6 and fx_root.isalpha():
+            if fx_root.endswith("JPY"):
+                return cls(point=0.001, contract_size=100_000.0,
+                           spread_points=20.0, slippage_points=3.0,
+                           pnl_divide_by_price=True)
+            divide = not fx_root.endswith("USD")
+            if fx_root.startswith("USD") and not fx_root.endswith("USD"):
+                divide = True
+            major = fx_root in cls._FX_MAJORS
+            spread = 12.0 if major else 18.0
+            slip = 2.0 if major else 3.0
+            return cls(point=0.00001, contract_size=100_000.0,
+                       spread_points=spread, slippage_points=slip,
+                       pnl_divide_by_price=divide)
+
+        # No usable symbol — fall back to price bands.
+        if price >= 400:
+            return cls(point=0.01, contract_size=100.0,
+                       spread_points=25.0, slippage_points=5.0)
+        if price < 20:
+            return cls(point=0.00001, contract_size=100_000.0,
+                       spread_points=15.0, slippage_points=2.0)
+        return cls(point=0.001, contract_size=100_000.0,
+                   spread_points=20.0, slippage_points=3.0,
+                   pnl_divide_by_price=True)
+
     @classmethod
     def infer(cls, price: float,
-              overrides: Optional[Mapping[str, float]] = None) -> "SymbolSpec":
-        """Infer the price scale from ``price`` and apply user overrides.
+              overrides: Optional[Mapping[str, float]] = None,
+              symbol: Optional[str] = None) -> "SymbolSpec":
+        """Infer the price scale from ``price`` / ``symbol`` and apply overrides.
 
-        ``point`` (and the scale-dependent defaults) are always inferred from
-        the first bar's price. Any economics supplied in ``overrides`` — the
-        user's chosen leverage/spread/slippage/contract size — then win over
-        the inferred defaults, so ``infer`` never clobbers user-provided
-        values while still auto-detecting the point size.
+        ``point`` and symbol-class defaults (contract size, typical spread)
+        always come from the instrument. Any economics supplied in
+        ``overrides`` — leverage / spread / slippage / contract size — then win
+        over the inferred defaults.
+
+        Price bands alone are not enough: USDJPY (~150) must not be treated like
+        gold (~2500). Without a symbol hint, mid-priced quotes use 3-digit FX
+        scaling; metals/CFDs use the high-price band.
         """
         from config import settings
-        if price < 20:                # 5-digit FX
-            spec = cls(point=0.00001)
-        else:
-            spec = cls(point=0.01, contract_size=100.0, spread_points=20.0)
+        spec = cls.defaults_for_symbol(symbol, price=price)
+        sym = cls.normalize_symbol(symbol)
+        if (not spec.pnl_divide_by_price and len(sym) >= 6
+                and sym.startswith("USD") and not sym.endswith("USD")):
+            spec.pnl_divide_by_price = True
         spec.dynamic_costs = getattr(settings, "SIMULATOR_DYNAMIC_COSTS", True)
         if overrides:
             for name in cls.OVERRIDABLE:
@@ -101,7 +236,8 @@ class Position:
     grid_level: int = 0
 
     def pnl_at(self, price: float, spec: SymbolSpec) -> float:
-        return self.direction * (price - self.entry_price) / spec.point * spec.point_value * self.lots
+        return spec.price_move_pnl(
+            self.direction * (price - self.entry_price), self.lots, price)
 
 
 @dataclass
@@ -144,7 +280,7 @@ class PositionBook:
              spread_points: Optional[float] = None,
              slippage_points: Optional[float] = None) -> Optional[Position]:
         price = self.fill_price(direction, bid, spread_points, slippage_points)
-        margin_needed = lots * self.spec.contract_size * price / self.spec.leverage
+        margin_needed = self.spec.margin_for(lots, price)
         if self.equity(bid) - self.margin_used(bid) < margin_needed:
             return None                                   # margin refusal
         pos = Position(
@@ -160,8 +296,8 @@ class PositionBook:
               lots: Optional[float] = None) -> float:
         """Close fully or partially; returns realized profit."""
         close_lots = min(lots, pos.lots) if lots is not None else pos.lots
-        profit = pos.direction * (price - pos.entry_price) / self.spec.point \
-            * self.spec.point_value * close_lots
+        profit = self.spec.price_move_pnl(
+            pos.direction * (price - pos.entry_price), close_lots, price)
         self.balance += profit
         self.closed.append(ClosedTrade(
             direction=pos.direction, lots=close_lots, entry_price=pos.entry_price,
@@ -189,8 +325,7 @@ class PositionBook:
         return self.balance + self.floating_pnl(bid)
 
     def margin_used(self, bid: float) -> float:
-        return sum(p.lots * self.spec.contract_size * bid / self.spec.leverage
-                   for p in self.positions)
+        return sum(self.spec.margin_for(p.lots, bid) for p in self.positions)
 
     def total_lots(self, hedges: bool = False) -> float:
         return sum(p.lots for p in self.positions if p.is_hedge == hedges)
@@ -723,7 +858,8 @@ def _tm_entry_allowed(tm, tp, hour: int, trades_today: int,
 
 def _entry_sizing(tm, tp, mech_type, mp, directional: bool, atr_price: float,
                   spec: SymbolSpec, base_lots: float, equity: float,
-                  max_open_lots: float) -> Tuple[float, float, float]:
+                  max_open_lots: float,
+                  entry_price: float = 0.0) -> Tuple[float, float, float]:
     """Return ``(sl_points, tp_points, lots)`` for a new entry under the overlay."""
     if not directional:
         if mech_type == ExecutionMechanicType.DCA_GRID:
@@ -734,20 +870,31 @@ def _entry_sizing(tm, tp, mech_type, mp, directional: bool, atr_price: float,
         sl_pts = 0.0
     elif tm.sl_mode == StopLossMode.ATR and atr_price > 0.0:
         sl_pts = atr_price / spec.point * tp.get("atr_sl_mult", 2.0)
-    else:                                     # FIXED (or ATR warmup fallback)
+    elif tm.sl_mode == StopLossMode.PERCENT and entry_price > 0.0 and spec.point > 0.0:
+        sl_pts = entry_price * (float(tp.get("sl_pct", 1.0)) / 100.0) / spec.point
+    else:                                     # FIXED (or ATR/percent warmup fallback)
         sl_pts = mp.get("sl_points", 0.0)
 
     if tm.tp_mode == TakeProfitMode.OFF:
         tp_pts = 0.0
     elif tm.tp_mode == TakeProfitMode.RR and sl_pts > 0.0:
         tp_pts = sl_pts * tp.get("tp_rr", 2.0)
+    elif tm.tp_mode == TakeProfitMode.PERCENT and entry_price > 0.0 and spec.point > 0.0:
+        tp_pts = entry_price * (float(tp.get("tp_pct", 1.5)) / 100.0) / spec.point
     else:
         tp_pts = mp.get("tp_points", 0.0)
 
-    if tm.lot_mode == LotMode.RISK_PERCENT and sl_pts > 0.0 and spec.point_value > 0:
-        risk_money = equity * tp.get("risk_percent", 1.0) / 100.0
-        lots = min(max(0.01, round(risk_money / (sl_pts * spec.point_value), 2)),
-                   max_open_lots)
+    if tm.lot_mode == LotMode.RISK_PERCENT and sl_pts > 0.0:
+        # Undiscounted tick value: for pnl_divide_by_price pairs this
+        # overstates risk-per-lot (~price×), which under-sizes lots — safe.
+        # Callers that need exact JPY sizing should pass a mark via ATR path.
+        tick_value = spec.point_value
+        if tick_value > 0:
+            risk_money = equity * tp.get("risk_percent", 1.0) / 100.0
+            lots = min(max(0.01, round(risk_money / (sl_pts * tick_value), 2)),
+                       max_open_lots)
+        else:
+            lots = base_lots
     else:
         lots = base_lots
     return sl_pts, tp_pts, lots
@@ -776,6 +923,9 @@ class SimulatorEngine(BacktestEngine):
         # Optional cancel probe set by the worker; every backtest this engine
         # runs (IS optimization, OOS, walk-forward) then honours it mid-loop.
         self._cancel_check: CancelCheck = None
+        # Optional per-engine override of SIMULATOR_INTRABAR_MODE (Stage-1
+        # screening forces "path" so Numba stays eligible for triage).
+        self._intrabar_mode_override: Optional[str] = None
 
     def run(self, strategy: StrategyDefinition, start: datetime, end: datetime,
             params_override: Optional[Dict[str, float]] = None,
@@ -802,10 +952,14 @@ class SimulatorEngine(BacktestEngine):
             raise ValueError("Not enough bars for a backtest")
 
         spec = self._spec_override or SymbolSpec.infer(
-            float(df["close"].iloc[0]), self._spec_overrides)
+            float(df["close"].iloc[0]), self._spec_overrides,
+            symbol=strategy.symbol)
 
         from config import settings
-        mode = getattr(settings, "SIMULATOR_INTRABAR_MODE", "path")
+        mode = (
+            self._intrabar_mode_override
+            or getattr(settings, "SIMULATOR_INTRABAR_MODE", "path")
+        )
         intrabar_df = None
         if (mode == "m1" and strategy.timeframe != "M1"
                 and self._ohlc_override is None
@@ -854,6 +1008,32 @@ def run_simulation(df: pd.DataFrame, strategy: StrategyDefinition,
 
     Returns the final PositionBook too so tests can assert fill sequences.
     """
+    from factory.param_scale import collapse_scaled_point_params
+    strategy = collapse_scaled_point_params(strategy)
+
+    # Fast path: Numba JIT for Standard SL/TP + Partial close (default mechanics).
+    # M1 mode without M1 data falls back to the path heuristic — still eligible.
+    try:
+        from factory.backtest.sim_numba_core import (
+            run_simulation_numba, strategy_numba_eligible,
+        )
+        effective_mode = intrabar_mode
+        if intrabar_mode == "m1" and (
+                intrabar_df is None or len(intrabar_df) == 0):
+            effective_mode = "path"
+        if strategy_numba_eligible(strategy, intrabar_mode=effective_mode):
+            return run_simulation_numba(
+                df, strategy, spec, deposit,
+                entry_mask=entry_mask, cancel_check=cancel_check,
+                intrabar_mode=effective_mode)
+    except Exception as exc:
+        # Fall through to Python PositionBook path (log once per process).
+        global _NUMBA_FALLBACK_LOGGED
+        if not _NUMBA_FALLBACK_LOGGED:
+            _NUMBA_FALLBACK_LOGGED = True
+            log.warning(
+                "Numba sim path failed; using Python PositionBook: %s", exc)
+
     long_sig, short_sig, _ = compute_signals(df, strategy, spec)
     if entry_mask is not None:
         long_sig = long_sig & entry_mask
@@ -955,6 +1135,32 @@ def run_simulation(df: pd.DataFrame, strategy: StrategyDefinition,
                 tp.get("regime_size_vol_trend", 1.0),
             ], dtype=float)
             regime_lot_mult = mults[codes]
+
+    # Causal 2-state HMM regime overlay (coexists with ADX/ATR regime).
+    use_hmm = (getattr(tm, "hmm_regime_filter", False)
+               or getattr(tm, "hmm_regime_sizing", False))
+    if use_hmm:
+        from factory.hmm_regime import (
+            allowed_by_hmm, classify_hmm_filter, lot_mult_from_codes,
+        )
+        hmm_codes, hmm_post = classify_hmm_filter(df, tp)
+        if getattr(tm, "hmm_regime_filter", False):
+            hmm_ok = allowed_by_hmm(
+                hmm_codes, hmm_post,
+                int(tp.get("hmm_allow_mask", 3)),
+                float(tp.get("hmm_min_prob", 0.55)),
+            )
+            regime_ok = hmm_ok if regime_ok is None else (regime_ok & hmm_ok)
+        if getattr(tm, "hmm_regime_sizing", False):
+            hmm_mult = lot_mult_from_codes(
+                hmm_codes,
+                float(tp.get("hmm_size_state0", 1.0)),
+                float(tp.get("hmm_size_state1", 1.0)),
+            )
+            regime_lot_mult = (
+                hmm_mult if regime_lot_mult is None
+                else regime_lot_mult * hmm_mult
+            )
     day_idx = times // 86400                      # integer trading-day index
     hour_of_day = ((times % 86400) // 3600).astype("int64")
     cur_day = -1
@@ -1022,15 +1228,26 @@ def run_simulation(df: pd.DataFrame, strategy: StrategyDefinition,
                                   grid_level=len(primaries),
                                   spread_points=g_spread,
                                   slippage_points=g_slip)
-                # basket TP off volume-weighted average price
+                # Shared basket SL/TP off volume-weighted average price.
+                # One stop level for every open leg — when hit, close the
+                # whole basket together (SL checked before TP).
                 primaries = [p for p in book.positions if not p.is_hedge]
                 if primaries:
                     tot = sum(p.lots for p in primaries)
                     avg = sum(p.entry_price * p.lots for p in primaries) / tot
-                    target = avg + d * mp["basket_tp_points"] * spec.point
-                    if (d > 0 and h >= target) or (d < 0 and l <= target):
-                        for p in list(primaries):
-                            book.close(p, target, t)
+                    basket_sl = float(mp.get("basket_sl_points", 0.0) or 0.0)
+                    closed_basket = False
+                    if basket_sl > 0.0:
+                        stop = avg - d * basket_sl * spec.point
+                        if (d > 0 and l <= stop) or (d < 0 and h >= stop):
+                            for p in list(primaries):
+                                book.close(p, stop, t)
+                            closed_basket = True
+                    if not closed_basket:
+                        target = avg + d * mp["basket_tp_points"] * spec.point
+                        if (d > 0 and h >= target) or (d < 0 and l <= target):
+                            for p in list(primaries):
+                                book.close(p, target, t)
 
         elif mech.type == ExecutionMechanicType.HEDGE_LAYER and book.positions:
             primaries = [p for p in book.positions if not p.is_hedge]
@@ -1110,7 +1327,8 @@ def run_simulation(df: pd.DataFrame, strategy: StrategyDefinition,
                              and not np.isnan(atr_arr[i]) else 0.0)
                 sl_pts, tp_pts, lots = _entry_sizing(
                     tm, tp, mech.type, mp, tm_directional, atr_price, spec,
-                    base_lots, book.equity(c), max_open_lots)
+                    base_lots, book.equity(c), max_open_lots,
+                    entry_price=float(c))
                 if regime_lot_mult is not None:
                     lots = max(0.01, round(lots * regime_lot_mult[i], 2))
                 if book.open(direction, lots, c, t,
@@ -1186,8 +1404,11 @@ def _metrics_from_book(book: PositionBook, deposit: float,
                        equity_ts: List[float], equity_curve: List[float],
                        max_dd_money: float, max_dd_pct: float,
                        df: pd.DataFrame) -> BacktestMetrics:
-    gross_profit = sum(tr.profit for tr in book.closed if tr.profit > 0)
-    gross_loss = -sum(tr.profit for tr in book.closed if tr.profit < 0)
+    wins = [tr.profit for tr in book.closed if tr.profit > 0]
+    losses = [tr.profit for tr in book.closed if tr.profit < 0]
+    gross_profit = sum(wins)
+    gross_loss = -sum(losses)
+    n_trades = len(book.closed)
     net = book.balance - deposit
     eq = np.asarray(equity_curve, dtype=float)
     rets = np.diff(eq) / np.maximum(eq[:-1], 1e-9)
@@ -1202,6 +1423,10 @@ def _metrics_from_book(book: PositionBook, deposit: float,
 
     chronological = sorted(book.closed, key=lambda tr: tr.close_time)
     consec_losses = max_consecutive_losses([tr.profit for tr in chronological])
+    win_rate = (len(wins) / n_trades) if n_trades else 0.0
+    avg_win = (sum(wins) / len(wins)) if wins else 0.0
+    avg_loss = (-sum(losses) / len(losses)) if losses else 0.0
+    expectancy = (net / n_trades) if n_trades else 0.0
 
     # thin the stored equity curve to keep DB rows small
     stride = max(1, len(equity_curve) // 2000)
@@ -1217,9 +1442,13 @@ def _metrics_from_book(book: PositionBook, deposit: float,
         sortino=round(sortino, 3),
         max_dd_pct=round(max_dd_pct, 3),
         max_dd_money=round(max_dd_money, 2),
-        trade_count=len(book.closed),
+        trade_count=n_trades,
         r_squared=equity_r_squared(equity_curve),
         max_consecutive_losses=consec_losses,
+        win_rate=round(win_rate, 4),
+        avg_win=round(avg_win, 4),
+        avg_loss=round(avg_loss, 4),
+        expectancy=round(expectancy, 4),
         initial_deposit=deposit,
         start_ts=float(equity_ts[0]) if equity_ts else 0.0,
         end_ts=float(equity_ts[-1]) if equity_ts else 0.0,

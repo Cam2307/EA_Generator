@@ -1,8 +1,9 @@
 """Headless MetaTrader 5 Strategy Tester wrapper.
 
 Design rules (see plan):
-- Terminal auto-detected via MetaTrader5.initialize() -> terminal_info().path,
-  overridable in config/settings.py.
+- Terminal auto-detected from the filesystem (settings override, AppData
+  origin.txt, common install dirs) — never via MetaTrader5.initialize(),
+  which starts an interactive terminal and leaves it running after shutdown.
 - Every tester .ini sets an explicit static Report= path under reports/.
 - XML reports parsed (not HTML) to avoid file-locking issues.
 - Strictly sequential execution guarded by a module lock; the worker also
@@ -85,8 +86,113 @@ class MT5Paths:
         return self.data_dir / "MQL5" / "Experts" / "EAFactory"
 
 
+def _read_origin_install(origin: Path) -> Optional[Path]:
+    """Parse MetaQuotes ``origin.txt`` (install path of a terminal data dir)."""
+    for encoding in ("utf-16", "utf-8-sig", "utf-8"):
+        try:
+            text = origin.read_text(encoding=encoding).strip()
+        except Exception:
+            continue
+        if not text:
+            continue
+        line = text.splitlines()[0].strip().strip("\x00")
+        if line:
+            return Path(line)
+    return None
+
+
+def _appdata_terminal_candidates() -> list[MT5Paths]:
+    """Discover installs via ``%APPDATA%\\MetaQuotes\\Terminal\\*\\origin.txt``.
+
+    This never launches MT5 — unlike ``MetaTrader5.initialize()``, which starts
+    an interactive ``terminal64.exe`` and leaves it running after shutdown.
+    """
+    appdata = os.environ.get("APPDATA") or ""
+    root = Path(appdata) / "MetaQuotes" / "Terminal"
+    if not root.is_dir():
+        return []
+    skip = {"Common", "Community", "Help"}
+    found: list[MT5Paths] = []
+    for data_dir in sorted(root.iterdir(), key=lambda p: p.name):
+        if not data_dir.is_dir() or data_dir.name in skip:
+            continue
+        origin = data_dir / "origin.txt"
+        if not origin.is_file():
+            continue
+        install = _read_origin_install(origin)
+        if install is None:
+            continue
+        terminal_exe = install / "terminal64.exe"
+        if not terminal_exe.is_file():
+            continue
+        editor = install / "metaeditor64.exe"
+        found.append(MT5Paths(
+            terminal_exe=terminal_exe,
+            metaeditor_exe=editor,
+            data_dir=data_dir,
+        ))
+    return found
+
+
+def _common_install_candidates() -> list[MT5Paths]:
+    """Fallback: well-known install directories (portable-style data dir = install)."""
+    bases = [
+        Path(r"C:\Program Files\MetaTrader 5"),
+        Path(r"C:\Program Files\MetaTrader"),
+        Path(r"C:\Program Files (x86)\MetaTrader 5"),
+        Path(r"C:\Program Files (x86)\MetaTrader"),
+    ]
+    found: list[MT5Paths] = []
+    for base in bases:
+        terminal_exe = base / "terminal64.exe"
+        if terminal_exe.is_file():
+            found.append(MT5Paths(
+                terminal_exe=terminal_exe,
+                metaeditor_exe=base / "metaeditor64.exe",
+                data_dir=base,
+            ))
+    return found
+
+
+def _pick_preferred(paths: list[MT5Paths]) -> MT5Paths:
+    """Prefer a vanilla MetaTrader install over prop-firm / renamed copies."""
+    if len(paths) == 1:
+        return paths[0]
+
+    def score(p: MT5Paths) -> tuple:
+        name = str(p.terminal_exe.parent).lower()
+        # Lower is better.
+        vanilla = 0 if name.rstrip("\\/").endswith(("metatrader 5", "metatrader")) else 1
+        return (vanilla, len(name), name)
+
+    return sorted(paths, key=score)[0]
+
+
+def _paths_for_terminal_exe(term: Path, editor: Optional[Path] = None) -> MT5Paths:
+    """Resolve data_dir for an explicit terminal exe (AppData hash folder if any)."""
+    term = term.resolve()
+    editor = editor if editor is not None else term.parent / "metaeditor64.exe"
+    for candidate in _appdata_terminal_candidates():
+        try:
+            if candidate.terminal_exe.resolve() == term:
+                return MT5Paths(
+                    terminal_exe=term,
+                    metaeditor_exe=editor if editor.exists() else candidate.metaeditor_exe,
+                    data_dir=candidate.data_dir,
+                )
+        except OSError:
+            continue
+    # Portable / unknown: data lives next to the exe.
+    return MT5Paths(terminal_exe=term, metaeditor_exe=editor, data_dir=term.parent)
+
+
 def detect_mt5() -> MT5Paths:
     """Locate terminal64.exe / metaeditor64.exe, honoring settings overrides.
+
+    Resolves paths from the filesystem (settings, AppData origin.txt, common
+    install dirs). Does **not** call ``MetaTrader5.initialize()`` — that API
+    starts an interactive terminal and ``shutdown()`` does not close it, which
+    then poisons headless Strategy Tester runs.
 
     Raises MT5RunnerError with a clear message when MT5 is not available.
     """
@@ -97,38 +203,15 @@ def detect_mt5() -> MT5Paths:
                 f"Configured MT5_TERMINAL_PATH does not exist: {term}")
         editor = Path(settings.MT5_METAEDITOR_PATH) if settings.MT5_METAEDITOR_PATH \
             else term.parent / "metaeditor64.exe"
-        return MT5Paths(terminal_exe=term, metaeditor_exe=editor,
-                        data_dir=term.parent)
+        return _paths_for_terminal_exe(term, editor)
 
-    try:
-        import MetaTrader5 as mt5
-    except ImportError as exc:
-        raise MT5RunnerError(
-            "MetaTrader5 python package is not installed; cannot auto-detect "
-            "the terminal.") from exc
+    candidates = _appdata_terminal_candidates() or _common_install_candidates()
+    if candidates:
+        return _pick_preferred(candidates)
 
-    try:
-        if not mt5.initialize():
-            code, desc = mt5.last_error()
-            raise MT5RunnerError(
-                f"MetaTrader 5 terminal not detected on this machine "
-                f"(initialize failed: {code} {desc}). Install MT5 or set "
-                f"MT5_TERMINAL_PATH in config/settings.py.")
-        info = mt5.terminal_info()
-        term_path = Path(info.path)
-        data_path = Path(info.data_path) if getattr(info, "data_path", None) else term_path
-        mt5.shutdown()
-    except MT5RunnerError:
-        raise
-    except Exception as exc:
-        raise MT5RunnerError(f"MT5 auto-detection failed: {exc}") from exc
-
-    terminal_exe = term_path / "terminal64.exe"
-    metaeditor_exe = term_path / "metaeditor64.exe"
-    if not terminal_exe.exists():
-        raise MT5RunnerError(f"terminal64.exe not found under {term_path}")
-    return MT5Paths(terminal_exe=terminal_exe, metaeditor_exe=metaeditor_exe,
-                    data_dir=data_path)
+    raise MT5RunnerError(
+        "MetaTrader 5 terminal not detected on this machine. Install MT5 or "
+        "set MT5_TERMINAL_PATH in config/settings.py.")
 
 
 def _terminal_running() -> bool:
@@ -141,7 +224,36 @@ def _terminal_running() -> bool:
         ).stdout
     except Exception:
         return False
-    return "terminal64.exe" in out
+    return "terminal64.exe" in out.lower()
+
+
+def kill_stray_terminals() -> None:
+    """Best-effort: terminate every ``terminal64.exe`` (Windows).
+
+    Used when *we* started the terminal via the Python API for a data pull and
+    must not leave it owning the data directory for headless tester runs.
+    """
+    if os.name != "nt":
+        return
+    try:
+        subprocess.run(  # noqa: S603,S607
+            ["taskkill", "/IM", "terminal64.exe", "/T", "/F"],
+            check=False,
+            capture_output=True,
+            **_subprocess_kwargs(),
+        )
+    except Exception:
+        pass
+
+
+def interactive_terminal_running() -> bool:
+    """Public preflight helper: True when a terminal64.exe instance is running.
+
+    Headless Strategy Tester runs share the terminal data directory with any
+    open ``terminal64.exe``, so discovery should fail fast rather than burn
+    the candidate budget on empty abort reports.
+    """
+    return _terminal_running()
 
 
 # ---------------------------------------------------------------------------
@@ -393,19 +505,9 @@ class MT5Runner(BacktestEngine):
             leverage=int(eff_leverage) if eff_leverage is not None else 100,
         )
 
-        # A headless tester run shares the terminal's data directory. If the
-        # terminal is already open interactively, the new instance exits
-        # immediately without running the tester (and without any error), so
-        # fail fast with a clear, job-record-friendly explanation instead.
-        # Pool-managed portable instances own their data dir, so the check
-        # (which sees ANY terminal64.exe, including other pool members) and
-        # the process-wide lock are skipped for them.
-        if self.exclusive and _terminal_running():
-            raise MT5RunnerError(
-                "MetaTrader 5 terminal is already running interactively. "
-                "Close the MT5 application and retry: headless tester runs "
-                "need exclusive use of the terminal data directory.")
-
+        # Pool-managed portable instances own their data dir, so the busy
+        # check (which sees ANY terminal64.exe, including other pool members)
+        # and the process-wide lock are skipped for them.
         cmd = [str(paths.terminal_exe), f"/config:{ini_path}"]
         if self.portable:
             cmd.append("/portable")
@@ -413,11 +515,19 @@ class MT5Runner(BacktestEngine):
         returncode = 0
         lane = _MT5_LOCK if self.exclusive else nullcontext()
         with lane:                          # sequential per shared install
+            # Check *inside* the lock so a leftover/orphan terminal from a
+            # prior run is visible before we spawn another /config instance.
+            if self.exclusive and interactive_terminal_running():
+                raise MT5RunnerError(
+                    "MetaTrader 5 terminal is already running interactively. "
+                    "Close the MT5 application and retry: headless tester runs "
+                    "need exclusive use of the terminal data directory.")
+            # Do not pass CREATE_NO_WINDOW here: terminal64 is a GUI app and
+            # needs a normal process/window lifetime for ShutdownTerminal=1.
             proc = subprocess.Popen(  # noqa: S603
                 cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                **_subprocess_kwargs(),
             )
             deadline = time.monotonic() + float(settings.MT5_RUN_TIMEOUT_SECONDS)
             try:
@@ -442,6 +552,11 @@ class MT5Runner(BacktestEngine):
             except Exception:
                 _terminate_process_tree(proc)
                 raise
+            finally:
+                # If our Popen handle is still alive, ShutdownTerminal=1 failed —
+                # tear the tree down so the next candidate is not INFRA-blocked.
+                if proc.poll() is None:
+                    _terminate_process_tree(proc)
         # MT5 may exit non-zero even on success; the report is the truth.
         try:
             metrics = parse_xml_report(report_path)

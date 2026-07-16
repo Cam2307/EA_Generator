@@ -12,8 +12,11 @@ import streamlit as st
 
 from app.components import theme
 from config import settings
+from factory.logutil import get_logger
 from factory.storage import Storage
 from jobs import worker
+
+log = get_logger(__name__)
 
 st.set_page_config(
     page_title="MQL5 EA Factory",
@@ -24,8 +27,9 @@ st.set_page_config(
 theme.inject_global_css()
 
 _NAV_OPTIONS = (
+    ":material/view_list: Runs",
     ":material/radar: Discovery",
-    ":material/grid_view: Strategy gallery",
+    ":material/grid_view: Strategies",
     ":material/download: Export",
 )
 
@@ -52,54 +56,27 @@ def _status_chips(storage: Storage) -> list[str]:
         else:
             chips.append(theme.chip("Agent idle", "gray"))
         active = [j for j in storage.list_jobs("discovery")
-                  if j.status.value == "RUNNING"]
+                  if j.status.value in ("RUNNING", "PENDING")]
         if active:
             chips.append(theme.chip(
-                f"{len(active)} job(s) in flight", "amber"))
-    except Exception:
-        pass
+                f"{len(active)} run(s) in flight", "amber"))
+    except Exception as exc:
+        log.warning("status chips failed: %s", exc)
     return chips
-
-
-def _kpi_strip(storage: Storage) -> None:
-    """Factory-wide numbers, cheap single-row queries only."""
-    try:
-        total = storage.count_validated(passed_only=None)
-        passing = storage.count_validated(passed_only=True)
-        states = storage.promotion_state_counts()
-        promoted = states.get("promoted_live_watchlist", 0)
-        edge = states.get("edge_positive", 0)
-        pass_rate = f"{passing / total:.0%}" if total else "—"
-        theme.kpi_row(
-            [
-                ("Candidates validated", f"{total:,}", ""),
-                ("Passing library", f"{passing:,}", "good" if passing else ""),
-                ("Pass rate", pass_rate, ""),
-                ("Edge positive", f"{edge:,}", "accent" if edge else ""),
-                ("Promoted / watchlist", f"{promoted:,}",
-                 "accent" if promoted else ""),
-            ],
-        )
-    except Exception:
-        pass
 
 
 def main() -> None:
     queue = get_queue()
     storage = get_storage()
 
+    chips = _status_chips(storage)
+
     theme.hero(
         "MQL5 EA Factory",
-        "Generate, backtest, validate, curate, and export MetaTrader 5 "
-        "Expert Advisors. The simulator is a pre-filter — final verification "
-        "belongs in the real MT5 Strategy Tester.",
-        chips=_status_chips(storage),
+        "Track discovery runs, launch new searches, curate survivors, and export EAs.",
+        chips=chips,
     )
-    _kpi_strip(storage)
 
-    # Segmented control (not st.tabs): hidden tabs still execute their bodies
-    # on every rerun, so Gallery/Export would deserialize the full validation
-    # library whenever Discovery start/stop triggered a rerun.
     view = st.segmented_control(
         "Section",
         options=list(_NAV_OPTIONS),
@@ -109,12 +86,15 @@ def main() -> None:
     )
 
     if view == _NAV_OPTIONS[0] or view is None:
+        from app.components.runs_panel import render_runs_panel
+        render_runs_panel(storage)
+    elif view == _NAV_OPTIONS[1]:
         from app.components.discovery_panel import render_discovery_panel
         render_discovery_panel(queue, storage)
-    elif view == _NAV_OPTIONS[1]:
+    elif view == _NAV_OPTIONS[2]:
         from app.components.strategy_card import render_gallery
         render_gallery(storage)
-    elif view == _NAV_OPTIONS[2]:
+    elif view == _NAV_OPTIONS[3]:
         from app.components.export_panel import render_export_panel
         render_export_panel(storage)
 

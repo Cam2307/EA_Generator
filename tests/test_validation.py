@@ -34,6 +34,41 @@ def test_wfe_zero_when_is_unprofitable():
     assert compute_wfe(_metrics(0, 10_000, 1.0), _metrics(300, 10_000, 0.5)) == 0.0
 
 
+def test_validate_skips_higher_work_when_l1_fails(monkeypatch):
+    """Failing L1 must not run WFO / higher-level scoring work."""
+    from factory.backtest import validation as val_mod
+
+    calls = {"wfo": 0}
+
+    def _no_wfo(*args, **kwargs):
+        calls["wfo"] += 1
+        return []
+
+    monkeypatch.setattr(val_mod, "walk_forward", _no_wfo)
+    # DD 80% fails L1 (max 70%).
+    report = validate_strategy(
+        ConstantRateEngine(dd_pct=80.0), _strategy(), START, END,
+        seed=1, run_montecarlo=False,
+        floor_level=1, ceiling_level=16)
+    assert report.highest_level_passed == 0
+    assert report.passed is False
+    assert report.levels_cleared.get("1") is False
+    assert report.levels_cleared.get("2") is False
+    assert calls["wfo"] == 0
+    assert report.wfo_windows == []
+
+
+def test_validate_nested_levels_never_skip_l1():
+    """Clearing a higher band without L1 is impossible under nested scoring."""
+    from factory import validation_levels
+    oos = BacktestMetrics(
+        net_profit=500.0, max_dd_pct=80.0, trade_count=100,
+        profit_factor=2.0, sharpe=2.0, r_squared=0.9,
+        initial_deposit=10_000.0)
+    # Would look strong on many gates except L1 DD.
+    assert validation_levels.highest_level_cleared(oos, wfe=0.9) == 0
+
+
 def test_annualized_profit_rate():
     m = _metrics(2000, 10_000, 2.0)
     assert m.annualized_profit_rate() == pytest.approx(0.10)
@@ -70,9 +105,11 @@ def _strategy():
         mechanic=ExecutionMechanic(
             type=ExecutionMechanicType.DCA_GRID,
             params={"grid_step_points": 200.0, "lot_multiplier": 1.5,
-                    "max_levels": 3.0, "basket_tp_points": 100.0},
+                    "max_levels": 3.0, "basket_tp_points": 100.0,
+                    "basket_sl_points": 400.0},
             ranges={"grid_step_points": ParamRange(min=100, max=500, step=50),
-                    "lot_multiplier": ParamRange(min=1.0, max=2.0, step=0.25)}),
+                    "lot_multiplier": ParamRange(min=1.0, max=2.0, step=0.25),
+                    "basket_sl_points": ParamRange(min=150, max=800, step=25)}),
     )
 
 
@@ -126,6 +163,7 @@ def test_optimizer_searches_mechanic_ranges():
     sampled_keys = set().union(*seen) if seen else set()
     assert "M_DCA_GRID_grid_step_points" in sampled_keys
     assert "M_DCA_GRID_lot_multiplier" in sampled_keys
+    assert "M_DCA_GRID_basket_sl_points" in sampled_keys
     assert "F0_RSI_REVERSION_rsi_period" in sampled_keys
     # and the sampled grid steps actually vary across the range
     grid_values = {p["M_DCA_GRID_grid_step_points"] for p in seen

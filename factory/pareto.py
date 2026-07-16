@@ -21,19 +21,23 @@ Objectives = Tuple[float, ...]
 
 
 def objectives_from_metrics(m: BacktestMetrics) -> Objectives:
-    """Screening objectives: (net profit, -max DD%, equity R², trade count).
+    """Screening objectives: (net profit, -max DD%, equity R², expectancy).
 
-    Trade count is capped so statistical significance is rewarded without
-    the front filling up with hyperactive overtraders; statistically empty
-    runs (< 3 trades) are pushed to a dominated corner outright.
+    Expectancy (mean $/trade) steers the search toward entry edges with
+    positive win-rate vs R:R rather than raw trade count. Trade count still
+    gates empty runs (< 3 trades → dominated corner).
     """
     if m.trade_count < 3:
-        return (-1e9, -1e9, 0.0, 0.0)
+        return (-1e9, -1e9, 0.0, -1e9)
+    exp = float(m.expectancy) if m.expectancy != 0.0 else (
+        float(m.net_profit) / max(m.trade_count, 1)
+    )
     return (
         float(m.net_profit),
-        -float(m.max_dd_pct),
+        # Scale DD so NSGA-II pressures risk harder relative to raw profit.
+        -float(m.max_dd_pct) * 2.0,
         float(m.r_squared),
-        float(min(m.trade_count, 100)),
+        exp,
     )
 
 

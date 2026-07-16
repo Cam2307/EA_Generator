@@ -1,3 +1,7 @@
+# Floor versions for flexible installs. For reproducible metrics / CI use:
+#   pip install -r requirements.lock
+optuna>=3.6
+cmaes>=0.10
 streamlit>=1.37
 MetaTrader5>=5.0.45
 pandas>=2.0
@@ -6,3 +10,5 @@ plotly>=5.20
 pydantic>=2.5
 pytest>=8.0
 pyarrow>=14.0
+scikit-learn>=1.3
+numba>=0.59

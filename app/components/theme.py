@@ -119,6 +119,88 @@ div[data-testid="stSegmentedControl"] button { font-weight: 600; }
 [data-testid="stExpander"] details {
     border-radius: 12px !important;
 }
+
+/* ---- runs table ----------------------------------------------------- */
+.ea-runs-table-wrap {
+    overflow-x: auto;
+    margin: 0.5rem 0 1rem;
+    border: 1px solid #2A3441;
+    border-radius: 12px;
+    background: #121820;
+}
+.ea-runs-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.78rem;
+    white-space: nowrap;
+}
+.ea-runs-table th {
+    position: sticky;
+    top: 0;
+    background: #161D26;
+    color: #8B95A5;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-size: 0.65rem;
+    padding: 0.55rem 0.65rem;
+    border-bottom: 1px solid #2A3441;
+    text-align: right;
+}
+.ea-runs-table th:first-child,
+.ea-runs-table th:nth-child(2),
+.ea-runs-table th:nth-child(3) { text-align: left; }
+.ea-runs-table td {
+    padding: 0.5rem 0.65rem;
+    border-bottom: 1px solid #1E2733;
+    color: #C5CAD3;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+}
+.ea-runs-table td.ea-run-id,
+.ea-runs-table td:nth-child(2),
+.ea-runs-table td:nth-child(3) { text-align: left; }
+.ea-runs-table tr:hover td { background: rgba(212,168,83,0.04); }
+.ea-run-id code { color: #E8EAED; font-size: 0.76rem; }
+.ea-run-pass { color: #2DD4BF; font-weight: 600; }
+.ea-run-lvl { color: #8B95A5; }
+.ea-run-lvl-anchor { color: #D4A853; font-weight: 600; }
+.ea-run-status {
+    display: inline-block;
+    padding: 0.12rem 0.45rem;
+    border-radius: 999px;
+    font-size: 0.68rem;
+    font-weight: 600;
+}
+
+/* ---- level pass bar (active run cards) ------------------------------ */
+.ea-level-bar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem;
+    margin-top: 0.35rem;
+}
+.ea-lvl-chip {
+    display: inline-flex;
+    flex-direction: column;
+    align-items: center;
+    min-width: 2.4rem;
+    padding: 0.2rem 0.35rem;
+    border-radius: 6px;
+    background: #161D26;
+    border: 1px solid #2A3441;
+    font-size: 0.62rem;
+    color: #8B95A5;
+    line-height: 1.2;
+}
+.ea-lvl-chip b {
+    font-size: 0.78rem;
+    color: #C5CAD3;
+    font-weight: 700;
+}
+.ea-lvl-chip.anchor { border-color: rgba(212,168,83,0.35); }
+.ea-lvl-chip.anchor b { color: #D4A853; }
+.ea-lvl-chip.live b { color: #2DD4BF; }
 </style>
 """
 
@@ -129,10 +211,15 @@ def inject_global_css() -> None:
 
 def chip(label: str, tone: str = "gray", dot: bool = True) -> str:
     """Inline HTML for a status chip (compose inside hero/cards)."""
-    fg, bg, border = _CHIP_TONES.get(tone, _CHIP_TONES["gray"])
+    fg, bg, border = chip_style(tone)
     dot_html = '<span class="dot"></span>' if dot else ""
     return (f'<span class="ea-chip" style="color:{fg};background:{bg};'
             f'border:1px solid {border}">{dot_html}{label}</span>')
+
+
+def chip_style(tone: str) -> tuple[str, str, str]:
+    """Return (foreground, background, border) for a chip tone."""
+    return _CHIP_TONES.get(tone, _CHIP_TONES["gray"])
 
 
 def hero(title: str, subtitle: str,

@@ -96,7 +96,7 @@ def reoptimize_strategy(storage: Storage, strategy_id: str, *,
         res.old_fitness = screen_fitness(old_m)
         # fresh optimization (candidate 0 is the incumbent, so the result
         # can never be worse than what we already run)
-        new_params, new_m, _stability = optimize_is(
+        new_params, new_m, *_rest = optimize_is(
             engine, current, start, end, deposit,
             n_samples or settings.OPT_SAMPLES, rng,
             stability=settings.NEIGHBORHOOD_STABILITY)

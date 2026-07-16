@@ -134,6 +134,35 @@ def test_app_settings_persist_recipient_email(temp_db: Path) -> None:
     assert restored["recipient_email"] == "alerts@example.com"
 
 
+def test_save_complete_persists_lineage_metadata(temp_db: Path) -> None:
+    from factory.models import Lineage
+
+    storage = Storage(temp_db)
+    strategy = _minimal_strategy()
+    strategy.lineage = Lineage(
+        parents=["parent_aaa", "parent_bbb"],
+        mutations=["entry_filters", "risk"],
+        generation=3,
+    )
+    report = _report_for(strategy, passed=True)
+    storage.save_complete(
+        strategy, report, job_id="job_lin",
+        metadata={
+            "sweep_symbol": "EURUSD",
+            "sweep_timeframe": "H1",
+            "parameter_snapshot": {"F0_rsi_period": 14.0},
+        },
+    )
+    meta = storage.get_strategy_metadata(strategy.id)
+    assert meta is not None
+    assert meta["operation"] == "crossover"
+    assert meta["parents_json"] == ["parent_aaa", "parent_bbb"]
+    assert meta["mutations_json"] == ["entry_filters", "risk"]
+    assert meta["generation"] == 3
+    assert meta["parent_id"] == "parent_aaa"
+    assert meta["pareto_rank"] is None
+
+
 def test_agent_state_migrates_legacy_schema(temp_db: Path) -> None:
     """Pre-migration DBs missing agent_state columns must upgrade on connect."""
     import sqlite3

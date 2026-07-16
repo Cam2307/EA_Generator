@@ -26,17 +26,31 @@ def test_clear_stale_lock_keeps_live_pid(tmp_path: Path, monkeypatch) -> None:
     assert lock.exists()
 
 
-def test_python_executable_prefers_active_venv(monkeypatch, tmp_path: Path) -> None:
-    venv_py = tmp_path / "Scripts" / "python.exe"
+def test_python_executable_prefers_project_venv(monkeypatch, tmp_path: Path) -> None:
+    venv_py = tmp_path / ".venv" / "Scripts" / "python.exe"
     venv_py.parent.mkdir(parents=True)
     venv_py.touch()
-    base_py = tmp_path / "base" / "python.exe"
-    base_py.parent.mkdir(parents=True)
-    base_py.touch()
-    monkeypatch.setattr(orch_mod.sys, "executable", str(venv_py))
-    monkeypatch.setattr(orch_mod.sys, "_base_executable", str(base_py))
+    system_py = tmp_path / "system" / "python.exe"
+    system_py.parent.mkdir(parents=True)
+    system_py.touch()
+    monkeypatch.setattr(orch_mod, "_project_root", lambda: tmp_path)
+    monkeypatch.setattr(orch_mod.sys, "executable", str(system_py))
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
 
     assert orch_mod._python_executable() == str(venv_py)
+
+
+def test_python_executable_windowless_prefers_pythonw(monkeypatch, tmp_path: Path) -> None:
+    venv_py = tmp_path / ".venv" / "Scripts" / "python.exe"
+    venv_pyw = tmp_path / ".venv" / "Scripts" / "pythonw.exe"
+    venv_py.parent.mkdir(parents=True)
+    venv_py.touch()
+    venv_pyw.touch()
+    monkeypatch.setattr(orch_mod, "_project_root", lambda: tmp_path)
+    monkeypatch.setattr(orch_mod.sys, "executable", str(venv_py))
+    monkeypatch.setattr(orch_mod.os, "name", "nt")
+
+    assert orch_mod._python_executable(windowless=True) == str(venv_pyw)
 
 
 def test_sync_agent_with_live_lock(tmp_path: Path, monkeypatch) -> None:

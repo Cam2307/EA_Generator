@@ -1,8 +1,8 @@
 """Central configuration for the EA Factory.
 
 Paths are resolved relative to the project root so the app can be launched
-from any working directory. MT5 paths default to auto-detection via the
-MetaTrader5 python package; set them explicitly here to override.
+from any working directory. MT5 paths default to filesystem auto-detection
+(AppData origin.txt / common install dirs); set them explicitly here to override.
 """
 from __future__ import annotations
 
@@ -14,12 +14,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = PROJECT_ROOT / "data"
 REPORTS_DIR = PROJECT_ROOT / "reports"
 OUTPUT_DIR = PROJECT_ROOT / "output"
+RESULTS_DIR = PROJECT_ROOT / "results"
 DB_PATH = DATA_DIR / "factory.db"
 
 # ---------------------------------------------------------------------------
 # MetaTrader 5 integration
 # ---------------------------------------------------------------------------
-# None -> auto-detect via MetaTrader5.initialize() / terminal_info().path
+# None -> auto-detect via AppData origin.txt / common install paths
+# (never via MetaTrader5.initialize() — that launches an interactive terminal).
 MT5_TERMINAL_PATH: Optional[str] = None
 MT5_METAEDITOR_PATH: Optional[str] = None
 MT5_RUN_TIMEOUT_SECONDS = 1800       # single headless backtest hard timeout
@@ -51,12 +53,17 @@ WFO_WINDOWS = 2              # default walk-forward windows (auto-derived from d
 WFO_TRAIN_MONTHS = 2         # default rolling WFO IS window (auto-derived from duration)
 WFO_TEST_MONTHS = 1          # default rolling WFO OOS window (auto-derived from duration)
 WFO_MODES = ("rolling",)     # "anchored" + "rolling" doubles WFO cost
-OPT_SAMPLES = 12             # random parameter samples for IS optimization
-WFO_OPT_SAMPLES = 6          # lighter sampling inside each WFO window
+OPT_SAMPLES = 48             # Optuna trials for main IS optimization (percent/ATR settle)
+WFO_OPT_SAMPLES = 16         # lighter Optuna budget inside each WFO window
+OPTUNA_SAMPLER = "auto"      # "tpe" | "cmaes" | "auto" (CMA-ES when continuous-heavy)
+OPTUNA_N_STARTUP_TRIALS = 3  # random trials before TPE/CMA-ES kicks in
+OPTUNA_PRUNE_SEGMENTS = 4    # chronological IS chunks for MedianPruner
+OPTUNA_TRACE_TOP_N = 10      # top trials persisted for explainability
 
 # Over-fitting protection in the optimizer: score a candidate parameter set
 # by the average fitness of its +/-1-step neighbors instead of its own peak.
-NEIGHBORHOOD_STABILITY = False
+# On by default so Robust+ stability honesty gates see real ratios (not 1.0).
+NEIGHBORHOOD_STABILITY = True
 NEIGHBOR_SAMPLES = 4         # neighbors evaluated per top candidate
 NEIGHBOR_TOP_K = 3           # top raw candidates re-scored by neighborhood
 
@@ -98,7 +105,46 @@ SIMULATOR_DYNAMIC_COSTS = True
 #   "path"         — OHLC path heuristic (bullish bar: open->low->high->close)
 #   "m1"           — replay real M1 bars inside each strategy bar; falls back
 #                    to "path" when M1 data is unavailable or synthetic
-SIMULATOR_INTRABAR_MODE = "m1"
+# "path" keeps discovery throughput high (Numba-eligible) while still
+# resolving intrabar SL/TP better than conservative. Use "m1" when you want
+# tick-path realism on a short survivor-confirm pass.
+SIMULATOR_INTRABAR_MODE = "path"
+
+# Stage-1 quick_screen intrabar mode. "path" keeps Numba eligible for the
+# high-volume triage pass; full validation still uses SIMULATOR_INTRABAR_MODE.
+SIMULATOR_SCREEN_INTRABAR_MODE = "path"
+
+# After Stage-1 path triage, re-screen promising candidates with Stage-2
+# realism (SIMULATOR_INTRABAR_MODE) before Optuna/WFO to cut false promotes.
+SIMULATOR_SCREEN_CONFIRM = True
+
+# When the user picks MT5 but an interactive terminal owns the data directory,
+# fall back to the simulator for Stage-2 instead of aborting the whole sweep
+# (which previously burned promising screens as empty INFRA fails).
+DISCOVERY_MT5_FALLBACK_TO_SIMULATOR = True
+
+# After a simulator survivor clears MT5_CONFIRM_MIN_LEVEL, re-run a cheap
+# MT5 confirmation pass and record ``mt5_confirmed`` on the report so
+# promotion can require real-tester agreement.
+DISCOVERY_MT5_CONFIRM_SURVIVORS = True
+MT5_CONFIRM_MIN_LEVEL = 7
+
+# Stage-1 reject: stop distance must be >= this multiple of recent ATR
+# (and >= SCREEN_MIN_STOP_COST_MULT × round-trip spread+slip).
+SCREEN_MIN_STOP_ATR_MULT = 0.25
+SCREEN_MIN_STOP_COST_MULT = 2.0
+
+# Inject mutants of prior L4+ survivors (same symbol/TF, else same class) into
+# each generation.
+DISCOVERY_ELITE_SEED_COUNT = 8
+# After a signal edge clears the validation floor, how many execution/mechanic
+# EA variants to enqueue for screening (edge-first mode).
+DISCOVERY_MAX_EDGE_VARIANTS = 8
+
+# Numba JIT of the Standard SL/TP + Partial-close bar loop (see
+# factory/backtest/sim_numba_core.py). Falls back to the Python PositionBook
+# path for DCA/grid/hedge, M1 intrabar, ATR overlays, or when numba is absent.
+SIMULATOR_NUMBA = True
 
 # ---------------------------------------------------------------------------
 # Untouched holdout (factory/holdout.py)
@@ -110,6 +156,12 @@ SIMULATOR_INTRABAR_MODE = "m1"
 HOLDOUT_ENABLED = True
 HOLDOUT_MONTHS = 12
 HOLDOUT_MAX_DD_PCT = 25.0    # holdout pass also requires DD under this
+
+# Promotion to edge_positive / promoted_live_watchlist requires a one-shot
+# holdout pass. Validated (lower) states remain available without it.
+PROMOTION_REQUIRE_HOLDOUT = True
+# Highest promotion state also requires MT5 confirmation when available.
+PROMOTION_REQUIRE_MT5_FOR_WATCHLIST = True
 
 # ---------------------------------------------------------------------------
 # Publication tier (factory/publication.py) — a far higher bar than the
@@ -168,12 +220,13 @@ SYMBOLS = [
 ]
 
 # Discovery-agent defaults (persisted overrides live in SQLite app_settings).
-DEFAULT_ALERT_RECIPIENT = "camdwg@gmail.com"
+# Leave empty — set via dashboard or EA_ALERT_RECIPIENT env; never hardcode.
+DEFAULT_ALERT_RECIPIENT = ""
 DEFAULT_ALERT_MIN_SCORE = 80.0
 DEFAULT_ALERT_COOLDOWN_MINUTES = 60
 DEFAULT_PROGRESS_EMAIL_HOURS = 1.0
 
 
 def ensure_dirs() -> None:
-    for d in (DATA_DIR, REPORTS_DIR, OUTPUT_DIR):
+    for d in (DATA_DIR, REPORTS_DIR, OUTPUT_DIR, RESULTS_DIR):
         d.mkdir(parents=True, exist_ok=True)

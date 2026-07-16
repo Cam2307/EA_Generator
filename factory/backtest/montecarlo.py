@@ -22,10 +22,17 @@ bands, a 0-100 robustness score, and a pass/fail gate.
 
 Honesty note (also in the docs): a strategy passing Monte Carlo is *less
 likely to be curve-fit*. Nothing here guarantees future profitability.
+
+Perturbation and block-bootstrap runs are evaluated on a small thread pool
+when cores are available. Discovery process-pool workers set
+``EA_DISCOVERY_POOL_WORKER=1`` so nested MC stays serial and does not
+oversubscribe cores already claimed by the outer generation pool.
 """
 from __future__ import annotations
 
+import os
 import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from typing import Callable, Dict, List, Mapping, Optional, Tuple
 
@@ -41,6 +48,20 @@ from factory.models import (
 
 # Cooperative cancellation probe (see factory.backtest.validation).
 CancelCheck = Optional[Callable[[], bool]]
+
+# Set by jobs.worker._pool_worker_init when running inside a discovery
+# ProcessPoolExecutor worker — nested MC must not spawn more workers.
+_DISCOVERY_POOL_ENV = "EA_DISCOVERY_POOL_WORKER"
+
+
+def _mc_worker_count(n_tasks: int) -> int:
+    """Thread count for MC runs: 1 inside an outer discovery pool worker."""
+    if n_tasks <= 1:
+        return 1
+    if os.environ.get(_DISCOVERY_POOL_ENV) == "1":
+        return 1
+    cores = os.cpu_count() or 2
+    return max(1, min(cores - 1, 8, n_tasks))
 
 
 @dataclass
@@ -187,6 +208,48 @@ def robustness_score(pct_profitable: float, profit_p05: float,
                           + 0.3 * dd_part), 1)
 
 
+def _one_perturbation_run(
+    strategy: StrategyDefinition, df: pd.DataFrame, run_spec: SymbolSpec,
+    deposit: float, flat_params: Dict[str, float], mask: np.ndarray,
+    cancel_check: CancelCheck,
+) -> Optional[Tuple[MonteCarloRun, List[float], List[float]]]:
+    """Execute one MC perturbation run; returns None on failure."""
+    if cancel_check is not None and cancel_check():
+        raise JobCancelled()
+    try:
+        perturbed = strategy.apply_flat_params(flat_params)
+        m, _ = run_simulation(df, perturbed, run_spec, deposit,
+                              entry_mask=mask, cancel_check=cancel_check)
+    except JobCancelled:
+        raise
+    except Exception:
+        return None
+    return (
+        MonteCarloRun(
+            net_profit=m.net_profit, max_dd_pct=m.max_dd_pct,
+            profit_factor=m.profit_factor, trade_count=m.trade_count),
+        m.equity,
+        m.equity_ts,
+    )
+
+
+def _one_path_run(
+    strategy: StrategyDefinition, bdf: pd.DataFrame, spec: SymbolSpec,
+    deposit: float, cancel_check: CancelCheck,
+) -> Optional[float]:
+    """Execute one block-bootstrap path run; returns net profit or None."""
+    if cancel_check is not None and cancel_check():
+        raise JobCancelled()
+    try:
+        pm, _ = run_simulation(bdf, strategy, spec, deposit,
+                               cancel_check=cancel_check)
+    except JobCancelled:
+        raise
+    except Exception:
+        return None
+    return pm.net_profit
+
+
 def run_montecarlo(strategy: StrategyDefinition, df: pd.DataFrame,
                    spec: SymbolSpec, deposit: float,
                    config: Optional[MonteCarloConfig] = None,
@@ -205,13 +268,9 @@ def run_montecarlo(strategy: StrategyDefinition, df: pd.DataFrame,
     base_profits = [tr.profit for tr in
                     sorted(base_book.closed, key=lambda t: t.close_time)]
 
-    runs: List[MonteCarloRun] = []
-    curves: List[List[float]] = []
-    band_ts: List[float] = []
-
+    # Pre-draw all RNG decisions so parallel workers stay deterministic.
+    pert_jobs: List[Tuple[SymbolSpec, Dict[str, float], np.ndarray]] = []
     for _ in range(cfg.n_runs):
-        if cancel_check is not None and cancel_check():
-            raise JobCancelled()
         run_spec = replace(
             spec,
             spread_points=rng.uniform(spec.spread_points,
@@ -221,34 +280,84 @@ def run_montecarlo(strategy: StrategyDefinition, df: pd.DataFrame,
                                         max(spec.slippage_points,
                                             cfg.slippage_max_points)),
         )
-        perturbed = strategy.apply_flat_params(perturb_flat_params(
-            strategy, rng, cfg.param_change_prob, cfg.param_max_steps))
+        flat = perturb_flat_params(
+            strategy, rng, cfg.param_change_prob, cfg.param_max_steps)
         mask = _entry_mask(n_bars, rng, cfg.skip_entry_prob,
                            cfg.start_jitter_bars)
-        try:
-            m, _ = run_simulation(df, perturbed, run_spec, deposit,
-                                  entry_mask=mask, cancel_check=cancel_check)
-        except Exception:
-            continue
-        runs.append(MonteCarloRun(
-            net_profit=m.net_profit, max_dd_pct=m.max_dd_pct,
-            profit_factor=m.profit_factor, trade_count=m.trade_count))
-        curves.append(m.equity)
-        if not band_ts:
-            band_ts = m.equity_ts
+        pert_jobs.append((run_spec, flat, mask))
+
+    path_dfs: List[pd.DataFrame] = [
+        block_bootstrap_ohlc(df, rng, cfg.path_block_bars)
+        for _ in range(max(0, cfg.path_runs))
+    ]
+
+    runs: List[MonteCarloRun] = []
+    curves: List[List[float]] = []
+    band_ts: List[float] = []
+
+    workers = _mc_worker_count(len(pert_jobs))
+    if workers <= 1 or not pert_jobs:
+        for run_spec, flat, mask in pert_jobs:
+            if cancel_check is not None and cancel_check():
+                raise JobCancelled()
+            got = _one_perturbation_run(
+                strategy, df, run_spec, deposit, flat, mask, cancel_check)
+            if got is None:
+                continue
+            run, equity, equity_ts = got
+            runs.append(run)
+            curves.append(equity)
+            if not band_ts:
+                band_ts = equity_ts
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futs = [
+                pool.submit(
+                    _one_perturbation_run, strategy, df, run_spec, deposit,
+                    flat, mask, cancel_check)
+                for run_spec, flat, mask in pert_jobs
+            ]
+            try:
+                for fut in as_completed(futs):
+                    got = fut.result()
+                    if got is None:
+                        continue
+                    run, equity, equity_ts = got
+                    runs.append(run)
+                    curves.append(equity)
+                    if not band_ts:
+                        band_ts = equity_ts
+            except JobCancelled:
+                for f in futs:
+                    f.cancel()
+                raise
 
     # -- price-path block bootstrap: counterfactual histories ---------------
     path_profits: List[float] = []
-    for _ in range(max(0, cfg.path_runs)):
-        if cancel_check is not None and cancel_check():
-            raise JobCancelled()
-        bdf = block_bootstrap_ohlc(df, rng, cfg.path_block_bars)
-        try:
-            pm, _ = run_simulation(bdf, strategy, spec, deposit,
-                                   cancel_check=cancel_check)
-        except Exception:
-            continue
-        path_profits.append(pm.net_profit)
+    path_workers = _mc_worker_count(len(path_dfs))
+    if path_workers <= 1 or not path_dfs:
+        for bdf in path_dfs:
+            if cancel_check is not None and cancel_check():
+                raise JobCancelled()
+            profit = _one_path_run(strategy, bdf, spec, deposit, cancel_check)
+            if profit is not None:
+                path_profits.append(profit)
+    else:
+        with ThreadPoolExecutor(max_workers=path_workers) as pool:
+            futs = [
+                pool.submit(_one_path_run, strategy, bdf, spec, deposit,
+                            cancel_check)
+                for bdf in path_dfs
+            ]
+            try:
+                for fut in as_completed(futs):
+                    profit = fut.result()
+                    if profit is not None:
+                        path_profits.append(profit)
+            except JobCancelled:
+                for f in futs:
+                    f.cancel()
+                raise
 
     reasons: List[str] = []
     if not runs:
@@ -346,6 +455,7 @@ def montecarlo_for_strategy(strategy: StrategyDefinition, start, end,
     if params_override:
         strategy = strategy.apply_flat_params(params_override)
     df = data_mod.load_ohlc(strategy.symbol, strategy.timeframe, start, end)
-    spec = SymbolSpec.infer(float(df["close"].iloc[0]), spec_overrides)
+    spec = SymbolSpec.infer(float(df["close"].iloc[0]), spec_overrides,
+                            symbol=strategy.symbol)
     return run_montecarlo(strategy, df, spec, deposit, config,
                           cancel_check=cancel_check)

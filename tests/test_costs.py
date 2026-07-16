@@ -80,6 +80,75 @@ def test_dynamic_costs_flag_on_inferred_spec(monkeypatch):
     assert SymbolSpec().dynamic_costs is False
 
 
+def test_infer_jpy_not_treated_as_metal():
+    """USDJPY (~150) must use 3-digit FX point scaling, not gold's 0.01.
+
+    The old ``price >= 20 → metal`` rule made a 15-point spread cost $15,000
+    per lot after a 100k contract override — Stage-1 screening never passed.
+    """
+    jpy = SymbolSpec.infer(150.5, {"contract_size": 100_000,
+                                   "spread_points": 15.0}, symbol="USDJPY")
+    assert jpy.point == pytest.approx(0.001)
+    assert jpy.contract_size == 100_000.0
+    assert jpy.pnl_divide_by_price is True
+    assert jpy.point_value_at(150.0) == pytest.approx(100.0 / 150.0)
+    # 15-point (=1.5 pip) spread on 1 lot ≈ $10 at 150 JPY
+    assert abs(jpy.price_move_pnl(0.015, 1.0, 150.0)) == pytest.approx(10.0)
+
+    # Mid-priced quote without a symbol hint still must not become a metal.
+    mid = SymbolSpec.infer(150.5, {"contract_size": 100_000})
+    assert mid.point == pytest.approx(0.001)
+    assert mid.pnl_divide_by_price is True
+
+    eurusd = SymbolSpec.infer(1.08, {"contract_size": 100_000,
+                                     "spread_points": 15.0}, symbol="EURUSD")
+    assert eurusd.point == pytest.approx(0.00001)
+    assert eurusd.pnl_divide_by_price is False
+    assert 15.0 * eurusd.point_value == pytest.approx(15.0)
+
+    gold = SymbolSpec.infer(2650.0, symbol="XAUUSD")
+    assert gold.point == pytest.approx(0.01)
+    assert gold.contract_size == 100.0
+    assert gold.spread_points == 25.0
+    assert gold.pnl_divide_by_price is False
+
+
+def test_defaults_for_symbol_covers_asset_classes():
+    fx = SymbolSpec.defaults_for_symbol("EURUSD")
+    assert fx.contract_size == 100_000.0
+    assert fx.spread_points == 12.0
+    assert fx.slippage_points == 2.0
+    assert fx.point == pytest.approx(0.00001)
+
+    jpy = SymbolSpec.defaults_for_symbol("USDJPY")
+    assert jpy.point == pytest.approx(0.001)
+    assert jpy.contract_size == 100_000.0
+    assert jpy.slippage_points == 3.0
+    assert jpy.pnl_divide_by_price is True
+
+    idx = SymbolSpec.defaults_for_symbol("US30")
+    assert idx.contract_size == 1.0
+    assert idx.point == pytest.approx(0.1)
+    assert idx.spread_points == 30.0
+    assert idx.slippage_points == 4.0
+
+    oil = SymbolSpec.defaults_for_symbol("USOIL")
+    assert oil.contract_size == 100.0
+    assert oil.point == pytest.approx(0.01)
+    assert oil.slippage_points == 5.0
+
+    btc = SymbolSpec.defaults_for_symbol("BTCUSD")
+    assert btc.contract_size == 1.0
+    assert btc.spread_points >= 100.0
+    assert btc.slippage_points >= 50.0
+
+    gold = SymbolSpec.defaults_for_symbol("XAUUSD")
+    assert gold.slippage_points == 5.0
+
+    # High-priced index must not inherit gold's 100-oz contract.
+    assert SymbolSpec.infer(35000.0, symbol="US30").contract_size == 1.0
+
+
 def test_simulation_runs_with_dynamic_costs():
     from factory.generator import random_strategy
     from factory.backtest.simulator import run_simulation

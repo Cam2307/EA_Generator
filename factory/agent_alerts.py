@@ -55,9 +55,20 @@ def sync_promotion_scores(storage: Storage, *, limit: int = 100) -> int:
     # candidate whose daily OOS returns track a promoted strategy is the same
     # edge under a different name and gets its score shaded accordingly.
     from factory.correlation import duplicate_penalty_from_corr, max_correlation
-    promoted = [r for r in storage.list_validated(passed_only=True)
-                if r.promotion_state in ("edge_positive",
-                                         "promoted_live_watchlist")]
+    # Cap the peer set — full-library deserialize of equity curves is too
+    # expensive for a background alert pass on large DBs.
+    promoted = []
+    try:
+        for r in storage.list_validated(passed_only=True, limit=80):
+            if r.promotion_state in ("edge_positive",
+                                    "promoted_live_watchlist"):
+                promoted.append(r)
+                if len(promoted) >= 40:
+                    break
+    except Exception:
+        promoted = []
+
+    from factory.holdout import evaluate_holdout
 
     for report in reports:
         sig = report_sig.get(report.strategy_id, "")
@@ -68,7 +79,20 @@ def sync_promotion_scores(storage: Storage, *, limit: int = 100) -> int:
             corr, _corr_id = max_correlation(report, promoted)
             duplicate_penalty = max(duplicate_penalty,
                                     duplicate_penalty_from_corr(corr))
-        decision = evaluate_promotion(report, duplicate_penalty=duplicate_penalty)
+        holdout_passed = getattr(report, "holdout_passed", None)
+        if report.passed and holdout_passed is None:
+            try:
+                hres = evaluate_holdout(storage, report.strategy_id)
+                holdout_passed = bool(hres.passed) if not hres.error else False
+                report.holdout_passed = holdout_passed
+            except Exception:
+                holdout_passed = False
+        decision = evaluate_promotion(
+            report,
+            duplicate_penalty=duplicate_penalty,
+            holdout_passed=holdout_passed,
+            mt5_confirmed=getattr(report, "mt5_confirmed", None),
+        )
         storage.update_validation_promotion(
             report.strategy_id,
             promotion_state=decision.promotion_state,
@@ -120,6 +144,60 @@ def maybe_send_quality_alerts(
             sent += 1
         except Exception:
             continue
+    return sent
+
+
+def note_watchdog_restart(storage: Storage) -> None:
+    """Mark that the watchdog just restarted the agent (email on next alert pass)."""
+    storage.update_agent_state(pending_watchdog_alert=1)
+
+
+def note_mt5_disagreement(storage: Storage, strategy_id: str, detail: str = "") -> None:
+    """Queue an alert when Stage-1 sim liked a candidate but MT5 Stage-2 failed."""
+    payload = f"{strategy_id}|{detail}"[:500]
+    storage.update_agent_state(pending_mt5_disagree_alert=payload)
+
+
+def maybe_send_ops_alerts(storage: Storage, *, recipient: str) -> int:
+    """Send pending watchdog / MT5-disagreement ops alerts (at most one each)."""
+    if not recipient.strip():
+        return 0
+    state = storage.get_agent_state()
+    sent = 0
+    if int(state.get("pending_watchdog_alert") or 0):
+        count = int(state.get("watchdog_restart_count") or 0)
+        body = (
+            "The discovery-agent watchdog restarted the orchestrator because "
+            "the heartbeat went stale.\n"
+            f"Restart count (lifetime): {count}\n"
+            f"Message: {state.get('message') or ''}\n"
+        )
+        try:
+            send_email(recipient, "EA Generator — agent watchdog restart", body)
+            storage.update_agent_state(pending_watchdog_alert=0)
+            sent += 1
+        except Exception:
+            pass
+    pending_mt5 = str(state.get("pending_mt5_disagree_alert") or "").strip()
+    if pending_mt5:
+        sid = pending_mt5.split("|", 1)[0]
+        detail = pending_mt5.split("|", 1)[1] if "|" in pending_mt5 else ""
+        body = (
+            "A candidate cleared the simulator Stage-1 screen but failed MT5 "
+            "Stage-2 confirmation — worth a look with scripts/reconcile_engines.py.\n"
+            f"Strategy: {sid}\n"
+            f"Detail: {detail or 'validation failed on MT5'}\n"
+        )
+        try:
+            send_email(
+                recipient,
+                "EA Generator — simulator/MT5 disagreement",
+                body,
+            )
+            storage.update_agent_state(pending_mt5_disagree_alert=None)
+            sent += 1
+        except Exception:
+            pass
     return sent
 
 

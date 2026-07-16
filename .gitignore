@@ -13,10 +13,17 @@ reports/*
 !reports/.gitkeep
 output/*
 !output/.gitkeep
+results/*
+!results/.gitkeep
 
 # Logs / temp
 *.log
 *.tmp
+
+# Secrets / local env
+.env
+.env.*
+!.env.example
 
 # Local agent/assistant config
 .claude/settings.local.json

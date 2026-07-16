@@ -1,0 +1,15 @@
+# Pinned install set for reproducible discovery metrics.
+# Install: pip install -r requirements.lock
+# Regenerate from a known-good venv: pip freeze > requirements.lock
+cmaes==0.13.0
+MetaTrader5==5.0.5735
+numba==0.66.0
+numpy==2.4.6
+optuna==4.9.0
+pandas==3.0.3
+plotly==6.8.0
+pyarrow==24.0.0
+pydantic==2.13.4
+pytest==9.1.1
+scikit-learn==1.9.0
+streamlit==1.59.0

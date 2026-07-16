@@ -10,23 +10,39 @@ from factory.models import (
     Lineage, LotMode, ParamRange, RiskBlock, StopLossMode, StrategyDefinition,
     StrategyProfile, TakeProfitMode, TradeManagement, TrailMode,
 )
+from factory.param_scale import (
+    POINT_DISTANCE_PARAM_NAMES, SCALE_RANGE, is_scale_key, sample_log_uniform,
+    scale_key_for,
+)
+from factory.symbol_class import (
+    HYPOTHESIS_FAMILIES, PERCENT_SL_SPECS, PERCENT_TP_SPECS, SymbolClass,
+    classify_symbol, infer_hypothesis_family as _infer_family_from_values,
+    prefers_relative_exits, requires_percent_exits,
+    scaled_mechanic_specs, scaled_tm_distance_specs,
+)
 
 # ---------------------------------------------------------------------------
 # Parameter templates per building block
+#
+# Point-distance knobs are searched as base × *_scale (SCALE_RANGE 1–20);
+# apply_flat_params collapses onto the original key so sim/MQL5 stay stable.
+# Multiplier/ratio knobs are widened in place — no second scale dim.
 # ---------------------------------------------------------------------------
 
 FILTER_PARAM_SPECS: Dict[EntryFilterType, Dict[str, ParamRange]] = {
     EntryFilterType.PRICE_ACTION_BREAKOUT: {
         "lookback": ParamRange(min=10, max=60, step=2),
-        "buffer_points": ParamRange(min=0, max=50, step=2),
+        "buffer_points": ParamRange(min=0, max=80, step=2),
+        "buffer_scale": SCALE_RANGE,
     },
     EntryFilterType.MTF_VOLATILITY: {
         "atr_period": ParamRange(min=7, max=28, step=1),
-        "atr_mult_min": ParamRange(min=0.5, max=1.5, step=0.1),
+        "atr_mult_min": ParamRange(min=0.5, max=2.5, step=0.1),
     },
     EntryFilterType.LIQUIDITY_ZONE: {
         "zone_lookback": ParamRange(min=20, max=100, step=5),
-        "zone_points": ParamRange(min=10, max=100, step=5),
+        "zone_points": ParamRange(min=10, max=150, step=5),
+        "zone_scale": SCALE_RANGE,
     },
     EntryFilterType.RSI_REVERSION: {
         "rsi_period": ParamRange(min=7, max=21, step=1),
@@ -39,7 +55,7 @@ FILTER_PARAM_SPECS: Dict[EntryFilterType, Dict[str, ParamRange]] = {
     },
     EntryFilterType.BOLLINGER_FADE: {
         "bb_period": ParamRange(min=14, max=28, step=1),
-        "bb_dev": ParamRange(min=1.5, max=3.0, step=0.25),
+        "bb_dev": ParamRange(min=1.5, max=3.5, step=0.25),
     },
     EntryFilterType.MACD_CROSS: {
         "fast_ema": ParamRange(min=8, max=16, step=1),
@@ -70,7 +86,7 @@ FILTER_PARAM_SPECS: Dict[EntryFilterType, Dict[str, ParamRange]] = {
     },
     EntryFilterType.VOLUME_SURGE: {
         "vol_period": ParamRange(min=10, max=50, step=2),
-        "vol_mult": ParamRange(min=1.2, max=3.0, step=0.1),
+        "vol_mult": ParamRange(min=1.2, max=4.0, step=0.1),
     },
     EntryFilterType.PARABOLIC_SAR: {
         "sar_step": ParamRange(min=0.01, max=0.05, step=0.005),
@@ -94,11 +110,11 @@ FILTER_PARAM_SPECS: Dict[EntryFilterType, Dict[str, ParamRange]] = {
     },
     EntryFilterType.STDDEV_REGIME: {
         "std_period": ParamRange(min=10, max=40, step=2),
-        "std_mult": ParamRange(min=1.0, max=2.5, step=0.1),
+        "std_mult": ParamRange(min=1.0, max=3.5, step=0.1),
     },
     EntryFilterType.ENVELOPES: {
         "env_period": ParamRange(min=14, max=40, step=1),
-        "env_deviation": ParamRange(min=0.05, max=0.5, step=0.025),
+        "env_deviation": ParamRange(min=0.05, max=0.75, step=0.025),
     },
     EntryFilterType.MFI: {
         "mfi_period": ParamRange(min=7, max=28, step=1),
@@ -114,28 +130,45 @@ FILTER_PARAM_SPECS: Dict[EntryFilterType, Dict[str, ParamRange]] = {
     },
 }
 
+# FX base grids (currency pairs). Wider than legacy 80–800 so Optuna can
+# reach swing-style stops; non-FX ignores these and uses percent SL/TP.
 MECHANIC_PARAM_SPECS: Dict[ExecutionMechanicType, Dict[str, ParamRange]] = {
     ExecutionMechanicType.STANDARD_SLTP: {
-        "sl_points": ParamRange(min=80, max=600, step=20),
-        "tp_points": ParamRange(min=80, max=900, step=20),
+        "sl_points": ParamRange(min=100, max=3000, step=50),
+        "sl_scale": SCALE_RANGE,
+        "tp_points": ParamRange(min=100, max=4000, step=50),
+        "tp_scale": SCALE_RANGE,
     },
     ExecutionMechanicType.DCA_GRID: {
-        "grid_step_points": ParamRange(min=80, max=500, step=20),
+        "grid_step_points": ParamRange(min=100, max=2000, step=50),
+        "grid_step_scale": SCALE_RANGE,
+        # Mild martingale allowed for search: 1.0 (flat) … 2.0 (2× per level).
         "lot_multiplier": ParamRange(min=1.0, max=2.0, step=0.1),
-        "max_levels": ParamRange(min=2, max=6, step=1),
-        "basket_tp_points": ParamRange(min=50, max=300, step=10),
+        "max_levels": ParamRange(min=2, max=4, step=1),
+        "basket_tp_points": ParamRange(min=80, max=2500, step=50),
+        "basket_tp_scale": SCALE_RANGE,
+        # One shared stop for the whole basket, measured from VWAP (same
+        # reference as basket TP). When hit, every open leg closes together.
+        "basket_sl_points": ParamRange(min=200, max=3500, step=50),
+        "basket_sl_scale": SCALE_RANGE,
     },
     ExecutionMechanicType.HEDGE_LAYER: {
-        "sl_points": ParamRange(min=150, max=800, step=25),
-        "tp_points": ParamRange(min=150, max=800, step=25),
-        "hedge_trigger_points": ParamRange(min=80, max=400, step=20),
-        "hedge_ratio": ParamRange(min=0.5, max=1.5, step=0.1),
+        "sl_points": ParamRange(min=150, max=3000, step=50),
+        "sl_scale": SCALE_RANGE,
+        "tp_points": ParamRange(min=150, max=3500, step=50),
+        "tp_scale": SCALE_RANGE,
+        "hedge_trigger_points": ParamRange(min=100, max=2000, step=50),
+        "hedge_trigger_scale": SCALE_RANGE,
+        "hedge_ratio": ParamRange(min=0.5, max=2.0, step=0.1),
     },
     ExecutionMechanicType.PARTIAL_CLOSE: {
-        "sl_points": ParamRange(min=80, max=600, step=20),
-        "tp_points": ParamRange(min=150, max=900, step=20),
-        "partial_tp_points": ParamRange(min=40, max=400, step=20),
-        "partial_fraction": ParamRange(min=0.25, max=0.75, step=0.05),
+        "sl_points": ParamRange(min=100, max=3000, step=50),
+        "sl_scale": SCALE_RANGE,
+        "tp_points": ParamRange(min=150, max=4000, step=50),
+        "tp_scale": SCALE_RANGE,
+        "partial_tp_points": ParamRange(min=80, max=2000, step=50),
+        "partial_tp_scale": SCALE_RANGE,
+        "partial_fraction": ParamRange(min=0.20, max=0.80, step=0.05),
     },
 }
 
@@ -145,16 +178,23 @@ MECHANIC_PARAM_SPECS: Dict[ExecutionMechanicType, Dict[str, ParamRange]] = {
 
 TM_PARAM_SPECS: Dict[str, ParamRange] = {
     "atr_period": ParamRange(min=10, max=20, step=2),
-    "atr_sl_mult": ParamRange(min=1.0, max=4.0, step=0.5),
-    "tp_rr": ParamRange(min=1.0, max=4.0, step=0.5),
-    "trail_start_points": ParamRange(min=100, max=600, step=50),
-    "trail_distance_points": ParamRange(min=100, max=600, step=50),
-    "trail_atr_mult": ParamRange(min=1.5, max=4.0, step=0.5),
+    "atr_sl_mult": ParamRange(min=1.0, max=8.0, step=0.5),
+    "tp_rr": ParamRange(min=1.0, max=6.0, step=0.5),
+    "sl_pct": ParamRange(min=0.1, max=2.5, step=0.1),
+    "tp_pct": ParamRange(min=0.1, max=4.0, step=0.1),
+    "trail_start_points": ParamRange(min=100, max=2500, step=50),
+    "trail_start_scale": SCALE_RANGE,
+    "trail_distance_points": ParamRange(min=100, max=2500, step=50),
+    "trail_distance_scale": SCALE_RANGE,
+    "trail_atr_mult": ParamRange(min=1.5, max=8.0, step=0.5),
     "chandelier_lookback": ParamRange(min=10, max=40, step=5),
-    "trail_step_points": ParamRange(min=10, max=60, step=10),
-    "be_trigger_points": ParamRange(min=100, max=500, step=50),
-    "be_offset_points": ParamRange(min=0, max=60, step=10),
-    "risk_percent": ParamRange(min=0.5, max=2.0, step=0.25),
+    "trail_step_points": ParamRange(min=10, max=200, step=10),
+    "trail_step_scale": SCALE_RANGE,
+    "be_trigger_points": ParamRange(min=100, max=2000, step=50),
+    "be_trigger_scale": SCALE_RANGE,
+    "be_offset_points": ParamRange(min=0, max=200, step=10),
+    "be_offset_scale": SCALE_RANGE,
+    "risk_percent": ParamRange(min=0.5, max=3.0, step=0.25),
     "start_hour": ParamRange(min=0, max=10, step=1),
     "end_hour": ParamRange(min=14, max=23, step=1),
     "max_trades_per_day": ParamRange(min=1, max=10, step=1),
@@ -167,20 +207,42 @@ TM_PARAM_SPECS: Dict[str, ParamRange] = {
     "regime_adx_period": ParamRange(min=10, max=24, step=2),
     "regime_adx_min": ParamRange(min=18, max=32, step=2),
     "regime_atr_period": ParamRange(min=10, max=20, step=2),
-    "regime_atr_mult": ParamRange(min=1.05, max=1.6, step=0.05),
+    "regime_atr_mult": ParamRange(min=1.05, max=2.0, step=0.05),
     # per-regime entry-lot multipliers (adaptive sizing)
-    "regime_size_quiet_range": ParamRange(min=0.25, max=2.0, step=0.25),
-    "regime_size_quiet_trend": ParamRange(min=0.25, max=2.0, step=0.25),
-    "regime_size_vol_range": ParamRange(min=0.25, max=2.0, step=0.25),
-    "regime_size_vol_trend": ParamRange(min=0.25, max=2.0, step=0.25),
+    "regime_size_quiet_range": ParamRange(min=0.25, max=3.0, step=0.25),
+    "regime_size_quiet_trend": ParamRange(min=0.25, max=3.0, step=0.25),
+    "regime_size_vol_range": ParamRange(min=0.25, max=3.0, step=0.25),
+    "regime_size_vol_trend": ParamRange(min=0.25, max=3.0, step=0.25),
+    # 2-state Gaussian HMM on log returns (factory/hmm_regime.py)
+    "hmm_mu0": ParamRange(min=-0.0005, max=0.0005, step=0.0001),
+    "hmm_mu1": ParamRange(min=-0.0005, max=0.0005, step=0.0001),
+    "hmm_sigma0": ParamRange(min=0.0002, max=0.0010, step=0.0001),
+    "hmm_sigma1": ParamRange(min=0.0010, max=0.0040, step=0.00025),
+    "hmm_p00": ParamRange(min=0.80, max=0.98, step=0.02),
+    "hmm_p11": ParamRange(min=0.70, max=0.95, step=0.05),
+    "hmm_pi0": ParamRange(min=0.3, max=0.7, step=0.1),
+    "hmm_min_prob": ParamRange(min=0.50, max=0.80, step=0.05),
+    "hmm_allow_mask": ParamRange(min=1, max=3, step=1),
+    "hmm_size_state0": ParamRange(min=0.25, max=3.0, step=0.25),
+    "hmm_size_state1": ParamRange(min=0.25, max=3.0, step=0.25),
 }
 
 # User-selectable trade-management feature categories (UI multiselect keys).
 TM_FEATURES: Tuple[str, ...] = (
-    "adaptive_sl", "risk_reward_tp", "trailing", "breakeven",
+    "adaptive_sl", "risk_reward_tp", "percent_exits", "trailing", "breakeven",
     "risk_sizing", "time_filter", "safeguards", "cooldown", "regime_filter",
-    "regime_sizing",
+    "regime_sizing", "hmm_regime_filter", "hmm_regime_sizing",
 )
+
+# Extra complexity contributed by trade-management overlays (added on top of
+# entry-filter costs so advanced EAs actually score higher when HMM/regime
+# features are enabled).
+_TM_COMPLEXITY_COST: Dict[str, int] = {
+    "regime_filter": 2,
+    "regime_sizing": 2,
+    "hmm_regime_filter": 3,
+    "hmm_regime_sizing": 2,
+}
 
 # Mechanics whose per-position exits accept the SL/TP/trailing/breakeven
 # overlay. Grid + hedge keep their bespoke basket recovery logic; they only
@@ -190,38 +252,73 @@ _DIRECTIONAL_MECHANICS = (
 )
 
 
-def _add_tm_param(tm: TradeManagement, name: str, rng: random.Random) -> None:
-    r = TM_PARAM_SPECS[name]
-    n_steps = int(round((r.max - r.min) / r.step)) if r.step > 0 else 0
-    tm.params[name] = r.min + rng.randint(0, n_steps) * r.step if n_steps else r.min
+def _tm_specs_for_class(symbol_class: SymbolClass) -> Dict[str, ParamRange]:
+    """TM param ranges with point distances + percent bands for ``symbol_class``."""
+    specs = scaled_tm_distance_specs(TM_PARAM_SPECS, symbol_class)
+    specs["sl_pct"] = PERCENT_SL_SPECS[symbol_class]
+    specs["tp_pct"] = PERCENT_TP_SPECS[symbol_class]
+    return specs
+
+
+def _add_tm_param(tm: TradeManagement, name: str, rng: random.Random,
+                  specs: Optional[Dict[str, ParamRange]] = None) -> None:
+    table = specs or TM_PARAM_SPECS
+    r = table[name]
+    if is_scale_key(name):
+        tm.params[name] = sample_log_uniform(r, rng)
+    else:
+        n_steps = int(round((r.max - r.min) / r.step)) if r.step > 0 else 0
+        tm.params[name] = (
+            r.min + rng.randint(0, n_steps) * r.step if n_steps else r.min
+        )
     tm.ranges[name] = r
+    if name in POINT_DISTANCE_PARAM_NAMES:
+        sk = scale_key_for(name)
+        if sk in table and sk not in tm.params:
+            _add_tm_param(tm, sk, rng, specs=table)
 
 
 def random_trade_mgmt(mech_type: ExecutionMechanicType, rng: random.Random,
-                      allowed: Optional[Sequence[str]] = None) -> TradeManagement:
+                      allowed: Optional[Sequence[str]] = None,
+                      symbol: Optional[str] = None) -> TradeManagement:
     """Randomly configure the exit/risk overlay for a new strategy.
 
     ``allowed`` restricts which feature categories may be switched on (UI
-    control); ``None`` allows all of :data:`TM_FEATURES`.
+    control); ``None`` allows all of :data:`TM_FEATURES`. Non-currency-pair
+    symbols always use percent SL/TP (0.1%–2.5% / 0.1%–4%). FX stays on
+    point / ATR / R:R exits with wider point search bands.
     """
     allow = set(allowed) if allowed is not None else set(TM_FEATURES)
     tm = TradeManagement()
     directional = mech_type in _DIRECTIONAL_MECHANICS
+    sym_class = classify_symbol(symbol)
+    specs = _tm_specs_for_class(sym_class)
+    use_percent = requires_percent_exits(sym_class)
+    relative = prefers_relative_exits(sym_class)
 
     if directional:
-        if "adaptive_sl" in allow and rng.random() < 0.5:
-            tm.sl_mode = StopLossMode.ATR
-        if "risk_reward_tp" in allow and rng.random() < 0.4:
-            tm.tp_mode = TakeProfitMode.RR
+        if use_percent:
+            # Crypto / metals / indices / oil: percent exits only.
+            tm.sl_mode = StopLossMode.PERCENT
+            tm.tp_mode = TakeProfitMode.PERCENT
+        else:
+            if "adaptive_sl" in allow and rng.random() < 0.55:
+                tm.sl_mode = StopLossMode.ATR
+            if "risk_reward_tp" in allow and rng.random() < 0.45:
+                tm.tp_mode = TakeProfitMode.RR
         if "trailing" in allow and rng.random() < 0.6:
-            tm.trail_mode = rng.choice(
-                [TrailMode.FIXED, TrailMode.ATR, TrailMode.CHANDELIER])
+            if relative:
+                tm.trail_mode = rng.choice(
+                    [TrailMode.ATR, TrailMode.ATR, TrailMode.CHANDELIER,
+                     TrailMode.FIXED])
+            else:
+                tm.trail_mode = rng.choice(
+                    [TrailMode.FIXED, TrailMode.ATR, TrailMode.CHANDELIER])
         if "breakeven" in allow and rng.random() < 0.5:
             tm.breakeven = True
-        if "risk_sizing" in allow and rng.random() < 0.4:
+        if "risk_sizing" in allow and rng.random() < (0.55 if relative else 0.4):
             tm.lot_mode = LotMode.RISK_PERCENT
 
-    # account-level filters apply to every mechanic
     if "time_filter" in allow and rng.random() < 0.3:
         tm.time_filter = True
     if "safeguards" in allow and rng.random() < 0.3:
@@ -234,50 +331,70 @@ def random_trade_mgmt(mech_type: ExecutionMechanicType, rng: random.Random,
         tm.regime_filter = True
     if "regime_sizing" in allow and rng.random() < 0.3:
         tm.regime_sizing = True
+    if "hmm_regime_filter" in allow and rng.random() < 0.28:
+        tm.hmm_regime_filter = True
+    if "hmm_regime_sizing" in allow and rng.random() < 0.25:
+        tm.hmm_regime_sizing = True
 
-    # populate optimizable sub-parameters only for the enabled features
     if tm.uses_atr():
-        _add_tm_param(tm, "atr_period", rng)
+        _add_tm_param(tm, "atr_period", rng, specs=specs)
     if tm.sl_mode == StopLossMode.ATR:
-        _add_tm_param(tm, "atr_sl_mult", rng)
+        _add_tm_param(tm, "atr_sl_mult", rng, specs=specs)
+    if tm.sl_mode == StopLossMode.PERCENT:
+        _add_tm_param(tm, "sl_pct", rng, specs=specs)
     if tm.tp_mode == TakeProfitMode.RR:
-        _add_tm_param(tm, "tp_rr", rng)
+        _add_tm_param(tm, "tp_rr", rng, specs=specs)
+    if tm.tp_mode == TakeProfitMode.PERCENT:
+        _add_tm_param(tm, "tp_pct", rng, specs=specs)
     if tm.trail_mode != TrailMode.OFF:
-        _add_tm_param(tm, "trail_start_points", rng)
-        _add_tm_param(tm, "trail_step_points", rng)
+        _add_tm_param(tm, "trail_start_points", rng, specs=specs)
+        _add_tm_param(tm, "trail_step_points", rng, specs=specs)
         if tm.trail_mode == TrailMode.FIXED:
-            _add_tm_param(tm, "trail_distance_points", rng)
+            _add_tm_param(tm, "trail_distance_points", rng, specs=specs)
         else:
-            _add_tm_param(tm, "trail_atr_mult", rng)
+            _add_tm_param(tm, "trail_atr_mult", rng, specs=specs)
         if tm.trail_mode == TrailMode.CHANDELIER:
-            _add_tm_param(tm, "chandelier_lookback", rng)
+            _add_tm_param(tm, "chandelier_lookback", rng, specs=specs)
     if tm.breakeven:
-        _add_tm_param(tm, "be_trigger_points", rng)
-        _add_tm_param(tm, "be_offset_points", rng)
+        _add_tm_param(tm, "be_trigger_points", rng, specs=specs)
+        _add_tm_param(tm, "be_offset_points", rng, specs=specs)
     if tm.lot_mode == LotMode.RISK_PERCENT:
-        _add_tm_param(tm, "risk_percent", rng)
+        _add_tm_param(tm, "risk_percent", rng, specs=specs)
     if tm.time_filter:
-        _add_tm_param(tm, "start_hour", rng)
-        _add_tm_param(tm, "end_hour", rng)
+        _add_tm_param(tm, "start_hour", rng, specs=specs)
+        _add_tm_param(tm, "end_hour", rng, specs=specs)
     if tm.limit_trades_per_day:
-        _add_tm_param(tm, "max_trades_per_day", rng)
+        _add_tm_param(tm, "max_trades_per_day", rng, specs=specs)
     if tm.daily_loss_enabled:
-        _add_tm_param(tm, "daily_loss_pct", rng)
+        _add_tm_param(tm, "daily_loss_pct", rng, specs=specs)
     if tm.cooldown_enabled:
-        _add_tm_param(tm, "cooldown_bars", rng)
+        _add_tm_param(tm, "cooldown_bars", rng, specs=specs)
     if tm.regime_filter or tm.regime_sizing:
-        # classification thresholds are shared by both regime features
-        _add_tm_param(tm, "regime_adx_period", rng)
-        _add_tm_param(tm, "regime_adx_min", rng)
-        _add_tm_param(tm, "regime_atr_period", rng)
-        _add_tm_param(tm, "regime_atr_mult", rng)
+        _add_tm_param(tm, "regime_adx_period", rng, specs=specs)
+        _add_tm_param(tm, "regime_adx_min", rng, specs=specs)
+        _add_tm_param(tm, "regime_atr_period", rng, specs=specs)
+        _add_tm_param(tm, "regime_atr_mult", rng, specs=specs)
     if tm.regime_filter:
-        _add_tm_param(tm, "regime_allow_mask", rng)
+        _add_tm_param(tm, "regime_allow_mask", rng, specs=specs)
     if tm.regime_sizing:
-        _add_tm_param(tm, "regime_size_quiet_range", rng)
-        _add_tm_param(tm, "regime_size_quiet_trend", rng)
-        _add_tm_param(tm, "regime_size_vol_range", rng)
-        _add_tm_param(tm, "regime_size_vol_trend", rng)
+        _add_tm_param(tm, "regime_size_quiet_range", rng, specs=specs)
+        _add_tm_param(tm, "regime_size_quiet_trend", rng, specs=specs)
+        _add_tm_param(tm, "regime_size_vol_range", rng, specs=specs)
+        _add_tm_param(tm, "regime_size_vol_trend", rng, specs=specs)
+    if tm.hmm_regime_filter or tm.hmm_regime_sizing:
+        _add_tm_param(tm, "hmm_mu0", rng, specs=specs)
+        _add_tm_param(tm, "hmm_mu1", rng, specs=specs)
+        _add_tm_param(tm, "hmm_sigma0", rng, specs=specs)
+        _add_tm_param(tm, "hmm_sigma1", rng, specs=specs)
+        _add_tm_param(tm, "hmm_p00", rng, specs=specs)
+        _add_tm_param(tm, "hmm_p11", rng, specs=specs)
+        _add_tm_param(tm, "hmm_pi0", rng, specs=specs)
+    if tm.hmm_regime_filter:
+        _add_tm_param(tm, "hmm_allow_mask", rng, specs=specs)
+        _add_tm_param(tm, "hmm_min_prob", rng, specs=specs)
+    if tm.hmm_regime_sizing:
+        _add_tm_param(tm, "hmm_size_state0", rng, specs=specs)
+        _add_tm_param(tm, "hmm_size_state1", rng, specs=specs)
     return tm
 
 
@@ -289,8 +406,12 @@ def describe_trade_mgmt(tm: TradeManagement) -> List[str]:
         lines.append(
             f"Adaptive stop: SL = ATR({p.get('atr_period', 14):.0f}) x "
             f"{p.get('atr_sl_mult', 2):.1f}.")
+    elif tm.sl_mode == StopLossMode.PERCENT:
+        lines.append(f"Percent stop: SL = {p.get('sl_pct', 1):.2f}% of entry price.")
     if tm.tp_mode == TakeProfitMode.RR:
         lines.append(f"Take profit at {p.get('tp_rr', 2):.1f}x the stop distance (R:R).")
+    elif tm.tp_mode == TakeProfitMode.PERCENT:
+        lines.append(f"Percent target: TP = {p.get('tp_pct', 1.5):.2f}% of entry price.")
     if tm.trail_mode == TrailMode.FIXED:
         lines.append(
             f"Trailing stop: fixed {p.get('trail_distance_points', 0):.0f} pts, "
@@ -340,6 +461,21 @@ def describe_trade_mgmt(tm: TradeManagement) -> List[str]:
             f" x{p.get('regime_size_quiet_trend', 1):.2f} (quiet trend),"
             f" x{p.get('regime_size_vol_range', 1):.2f} (volatile range),"
             f" x{p.get('regime_size_vol_trend', 1):.2f} (volatile trend).")
+    if tm.hmm_regime_filter:
+        from factory.hmm_regime import HMM_STATE_NAMES
+        mask = int(p.get("hmm_allow_mask", 3))
+        allowed = [HMM_STATE_NAMES[c] for c in (0, 1) if (mask >> c) & 1]
+        lines.append(
+            "HMM regime filter: trade only in "
+            + (", ".join(allowed) if allowed else "no")
+            + f" (σ₀={p.get('hmm_sigma0', 0.0005):.4f},"
+            f" σ₁={p.get('hmm_sigma1', 0.002):.4f},"
+            f" min P={p.get('hmm_min_prob', 0.55):.2f}).")
+    if tm.hmm_regime_sizing:
+        lines.append(
+            "HMM regime sizing: entry lots x"
+            f"{p.get('hmm_size_state0', 1):.2f} (state 0),"
+            f" x{p.get('hmm_size_state1', 1):.2f} (state 1).")
     return lines
 
 
@@ -439,14 +575,85 @@ class GenerationSettings:
     enable_regime_switching: bool = False
     enable_mtf_context: bool = False
     feature_toggles: Optional[Sequence[str]] = None
+    # When True, pick filters from a single hypothesis family (Phase-4 narrowing)
+    # instead of freely mixing all compatible indicators.
+    hypothesis_families: bool = True
+    # Empirical L4+ clear weights (family name / filter type value → weight).
+    # Empty/None keeps uniform priors (cold start).
+    family_weights: Optional[Dict[str, float]] = None
+    filter_weights: Optional[Dict[str, float]] = None
 
 
 def _sample_params(specs: Dict[str, ParamRange], rng: random.Random) -> Dict[str, float]:
     out: Dict[str, float] = {}
     for name, r in specs.items():
+        if is_scale_key(name):
+            out[name] = sample_log_uniform(r, rng)
+            continue
         n_steps = int(round((r.max - r.min) / r.step)) if r.step > 0 else 0
         out[name] = r.min + rng.randint(0, n_steps) * r.step if n_steps else r.min
     return out
+
+
+def infer_hypothesis_family(strategy: StrategyDefinition) -> Optional[str]:
+    """Best-matching hypothesis family for ``strategy`` entry filters."""
+    return _infer_family_from_values(f.type.value for f in strategy.entry_filters)
+
+
+def blend_family_weights(
+    clear_counts: Optional[Dict[str, int]] = None,
+    *,
+    prior_strength: float = 8.0,
+) -> Dict[str, float]:
+    """Blend uniform family priors with empirical L4+ clear counts."""
+    weights = {name: 1.0 for name in HYPOTHESIS_FAMILIES}
+    if not clear_counts:
+        return weights
+    for key, n in clear_counts.items():
+        if key not in weights:
+            continue
+        weights[key] = weights[key] + prior_strength * max(0, int(n))
+    return weights
+
+
+def blend_filter_weights(
+    clear_counts: Optional[Dict[str, int]] = None,
+    *,
+    prior_strength: float = 8.0,
+) -> Dict[str, float]:
+    """Blend uniform filter priors with empirical L4+ clear counts.
+
+    Keys are ``EntryFilterType.value`` strings. Unknown keys are ignored;
+    filters with no clears keep weight 1.0.
+    """
+    weights: Dict[str, float] = {ft.value: 1.0 for ft in EntryFilterType}
+    if not clear_counts:
+        return weights
+    for key, n in clear_counts.items():
+        if key not in weights:
+            continue
+        weights[key] = weights[key] + prior_strength * max(0, int(n))
+    return weights
+
+
+def _weighted_sample(
+    items: Sequence[EntryFilterType],
+    weights: Dict[str, float],
+    k: int,
+    rng: random.Random,
+) -> List[EntryFilterType]:
+    """Sample ``k`` distinct filters with replacement-free weighted draws."""
+    pool = list(items)
+    if not pool or k <= 0:
+        return []
+    k = min(k, len(pool))
+    chosen: List[EntryFilterType] = []
+    for _ in range(k):
+        w = [max(1e-9, float(weights.get(ft.value, 1.0))) for ft in pool]
+        pick = rng.choices(pool, weights=w, k=1)[0]
+        chosen.append(pick)
+        pool.remove(pick)
+    return chosen
 
 
 def _is_allowed_by_toggle(ft: EntryFilterType, toggles: Optional[Sequence[str]]) -> bool:
@@ -464,28 +671,73 @@ def _is_allowed_by_toggle(ft: EntryFilterType, toggles: Optional[Sequence[str]])
     return False
 
 
+def _hypothesis_family_pool(
+    compatible: Sequence[EntryFilterType],
+    rng: random.Random,
+    family_weights: Optional[Dict[str, float]] = None,
+) -> List[EntryFilterType]:
+    """Restrict to one named hypothesis family intersected with ``compatible``.
+
+    Family choice is weighted by ``family_weights`` (empirical L4+ clears);
+    cold start (missing/empty weights) is uniform.
+    """
+    compat = set(compatible)
+    viable_names: List[str] = []
+    viable_pools: List[List[EntryFilterType]] = []
+    for name, members in HYPOTHESIS_FAMILIES.items():
+        family: List[EntryFilterType] = []
+        for raw in members:
+            try:
+                ft = EntryFilterType(raw)
+            except ValueError:
+                continue
+            if ft in compat:
+                family.append(ft)
+        if family:
+            viable_names.append(name)
+            viable_pools.append(family)
+    if not viable_names:
+        return list(compatible)
+    weights = [
+        max(1e-9, float((family_weights or {}).get(n, 1.0)))
+        for n in viable_names
+    ]
+    idx = rng.choices(range(len(viable_names)), weights=weights, k=1)[0]
+    return viable_pools[idx]
+
+
 def _pick_filter_pack(
     compatible: Sequence[EntryFilterType],
     rng: random.Random,
     settings: GenerationSettings,
 ) -> List[EntryFilterType]:
-    allowed = [ft for ft in compatible if _is_allowed_by_toggle(ft, settings.feature_toggles)]
+    pool_src = compatible
+    if settings.hypothesis_families:
+        pool_src = _hypothesis_family_pool(
+            compatible, rng, family_weights=settings.family_weights)
+    allowed = [ft for ft in pool_src if _is_allowed_by_toggle(ft, settings.feature_toggles)]
     if not allowed:
-        allowed = list(compatible)
+        allowed = list(pool_src) or list(compatible)
+
+    fweights = settings.filter_weights or {}
 
     if not settings.advanced_mode:
-        return rng.sample(allowed, rng.randint(1, min(3, len(allowed))))
+        k = rng.randint(1, min(3, len(allowed)))
+        return _weighted_sample(allowed, fweights, k, rng)
 
     cap = max(2, min(10, int(settings.complexity_cap)))
     chosen: List[EntryFilterType] = []
     budget = cap
-    pool = list(allowed)
-    rng.shuffle(pool)
+    # Stochastic weighted order: higher-weight filters tend to appear first.
+    pool = sorted(
+        allowed,
+        key=lambda ft: rng.random() / max(1e-9, float(fweights.get(ft.value, 1.0))),
+    )
 
     if settings.enable_regime_switching:
         regime = [f for f in pool if f in _REGIME_FILTERS]
         if regime:
-            f = rng.choice(regime)
+            f = _weighted_sample(regime, fweights, 1, rng)[0]
             chosen.append(f)
             budget -= _COMPLEXITY_COST.get(f, 1)
 
@@ -671,8 +923,9 @@ def describe_rules(strategy: StrategyDefinition) -> str:
     elif m.type == ExecutionMechanicType.DCA_GRID:
         lines.append(
             f"Exit: DCA grid — add every {mp['grid_step_points']:.0f} pts against entry, "
-            f"lot x{mp['lot_multiplier']:.2f}, max {mp['max_levels']:.0f} levels; basket TP "
-            f"{mp['basket_tp_points']:.0f} pts from average price."
+            f"lot x{mp['lot_multiplier']:.2f}, max {mp['max_levels']:.0f} levels; "
+            f"shared basket SL {mp.get('basket_sl_points', 0):.0f} pts / "
+            f"TP {mp['basket_tp_points']:.0f} pts from average price."
         )
     elif m.type == ExecutionMechanicType.HEDGE_LAYER:
         lines.append(
@@ -696,12 +949,46 @@ def describe_rules(strategy: StrategyDefinition) -> str:
     return "\n".join(lines)
 
 
+def default_mechanic_weights() -> Dict[ExecutionMechanicType, float]:
+    """Priors favoring defined-risk mechanics over recovery grids."""
+    return {
+        ExecutionMechanicType.STANDARD_SLTP: 4.0,
+        ExecutionMechanicType.PARTIAL_CLOSE: 3.0,
+        ExecutionMechanicType.DCA_GRID: 1.0,
+        ExecutionMechanicType.HEDGE_LAYER: 1.0,
+    }
+
+
+def blend_mechanic_weights(
+    clear_counts: Optional[Dict[str, int]] = None,
+    *,
+    prior_strength: float = 8.0,
+) -> Dict[ExecutionMechanicType, float]:
+    """Blend fixed priors with empirical L4+ clear counts.
+
+    ``clear_counts`` keys are mechanic ``.value`` strings. Empty/None keeps
+    the default priors unchanged.
+    """
+    weights = default_mechanic_weights()
+    if not clear_counts:
+        return weights
+    for key, n in clear_counts.items():
+        try:
+            mech = ExecutionMechanicType(key)
+        except ValueError:
+            continue
+        weights[mech] = weights.get(mech, 1.0) + prior_strength * max(0, int(n))
+    return weights
+
+
 def random_strategy(symbol: str, timeframe: str,
                     rng: Optional[random.Random] = None,
                     generation: int = 0,
                     allowed_mechanics: Optional[Sequence[ExecutionMechanicType]] = None,
                     allowed_tm_features: Optional[Sequence[str]] = None,
                     generation_settings: Optional[GenerationSettings] = None,
+                    mechanic_weights: Optional[Dict[ExecutionMechanicType, float]] = None,
+                    search_phase: Optional[str] = None,
                     ) -> StrategyDefinition:
     """Build a random strategy.
 
@@ -709,23 +996,46 @@ def random_strategy(symbol: str, timeframe: str,
     (e.g. only DCA/grid + hedging). ``None`` or empty allows every mechanic.
     ``allowed_tm_features`` restricts which trade-management overlays (trailing,
     adaptive SL, etc.) may be switched on; ``None`` allows all.
+    ``mechanic_weights`` overrides the default style priors (survivor bias).
+    ``search_phase="edge"`` forces a STANDARD_SLTP R:R probe so discovery
+    searches entry edges before enumerating execution variants.
     """
     rng = rng or random.Random()
     generation_settings = generation_settings or GenerationSettings()
-    choices = [m for m in (allowed_mechanics or list(ExecutionMechanicType))
-               if m in MECHANIC_PARAM_SPECS] or list(ExecutionMechanicType)
-    mech_type = rng.choice(choices)
+    edge_phase = (search_phase or "").lower() == "edge"
+    sym_class = classify_symbol(symbol)
+    mech_specs = scaled_mechanic_specs(MECHANIC_PARAM_SPECS, sym_class)
+    # Scale filter point distances (buffer / zone) the same way.
+    from factory.symbol_class import point_distance_mult, scale_param_range
+    mult = point_distance_mult(sym_class)
+
+    if edge_phase:
+        choices = [ExecutionMechanicType.STANDARD_SLTP]
+        mech_type = ExecutionMechanicType.STANDARD_SLTP
+    else:
+        choices = [m for m in (allowed_mechanics or list(ExecutionMechanicType))
+                   if m in mech_specs] or list(ExecutionMechanicType)
+        # Prefer defined-risk mechanics when several styles are allowed so
+        # recovery grids do not crowd the survivor pool under loose gates.
+        base_weights = mechanic_weights or default_mechanic_weights()
+        weights = [float(base_weights.get(m, 1.0)) for m in choices]
+        mech_type = rng.choices(choices, weights=weights, k=1)[0]
     compatible = LOGIC_MATRIX[mech_type]
     filter_types = _pick_filter_pack(compatible, rng, generation_settings)
 
-    filters = [
-        EntryFilter(type=ft, params=_sample_params(FILTER_PARAM_SPECS[ft], rng),
-                    ranges=dict(FILTER_PARAM_SPECS[ft]))
-        for ft in filter_types
-    ]
+    filters = []
+    for ft in filter_types:
+        fspecs = dict(FILTER_PARAM_SPECS[ft])
+        if mult != 1.0:
+            for pname, pr in list(fspecs.items()):
+                if pname.endswith("_points"):
+                    fspecs[pname] = scale_param_range(pr, mult)
+        filters.append(EntryFilter(
+            type=ft, params=_sample_params(fspecs, rng), ranges=dict(fspecs)))
+    mspecs = mech_specs[mech_type]
     mechanic = ExecutionMechanic(
-        type=mech_type, params=_sample_params(MECHANIC_PARAM_SPECS[mech_type], rng),
-        ranges=dict(MECHANIC_PARAM_SPECS[mech_type]),
+        type=mech_type, params=_sample_params(mspecs, rng),
+        ranges=dict(mspecs),
     )
     # Signal-composition logic: with 2+ filters, occasionally combine them
     # disjunctively (any) or by vote (majority) instead of the classic AND —
@@ -738,12 +1048,27 @@ def random_strategy(symbol: str, timeframe: str,
         elif roll > 0.60:
             signal_logic = "any"
 
+    if edge_phase:
+        from factory.edge import EDGE_TM_FEATURES, edge_probe_trade_mgmt
+        tm = edge_probe_trade_mgmt(symbol, rng)
+        tm_allow = allowed_tm_features if allowed_tm_features is not None \
+            else EDGE_TM_FEATURES
+        # Keep probes lean even if the UI enabled trailing etc.
+        _ = tm_allow
+        role = "edge"
+        phase = "edge"
+    else:
+        tm = random_trade_mgmt(
+            mech_type, rng, allowed_tm_features, symbol=symbol)
+        role = ""
+        phase = ""
+
     strat = StrategyDefinition(
         symbol=symbol, timeframe=timeframe, entry_filters=filters,
         signal_logic=signal_logic,
         mechanic=mechanic, risk=RiskBlock(),
-        trade_mgmt=random_trade_mgmt(mech_type, rng, allowed_tm_features),
-        lineage=Lineage(generation=generation),
+        trade_mgmt=tm,
+        lineage=Lineage(generation=generation, role=role),
         profile=StrategyProfile(
             advanced_mode=generation_settings.advanced_mode,
             complexity_cap=(
@@ -753,12 +1078,14 @@ def random_strategy(symbol: str, timeframe: str,
             regime_switching=bool(generation_settings.enable_regime_switching),
             mtf_context=bool(generation_settings.enable_mtf_context),
             feature_toggles=list(generation_settings.feature_toggles or []),
+            search_phase=phase,
         ),
     )
     _apply_advanced_risk_profile(strat, rng, generation_settings)
-    strat.profile.complexity_score = int(
-        sum(_COMPLEXITY_COST.get(f.type, 1) for f in strat.entry_filters)
-    )
+    strat.profile.complexity_score = _complexity_score(strat)
+    if generation_settings.advanced_mode:
+        _enforce_complexity_cap(strat, int(generation_settings.complexity_cap))
+        strat.profile.complexity_score = _complexity_score(strat)
     strat.profile.portfolio_signature = "|".join(
         [
             strat.symbol,
@@ -771,6 +1098,43 @@ def random_strategy(symbol: str, timeframe: str,
     strat.magic_number = _MAGIC_BASE + int(strat.id[:6], 16) % 100000
     strat.rule_description = describe_rules(strat)
     return strat
+
+
+def _complexity_score(strat: StrategyDefinition) -> int:
+    filter_cost = sum(_COMPLEXITY_COST.get(f.type, 1) for f in strat.entry_filters)
+    tm = strat.trade_mgmt
+    tm_cost = 0
+    if tm.regime_filter:
+        tm_cost += _TM_COMPLEXITY_COST["regime_filter"]
+    if tm.regime_sizing:
+        tm_cost += _TM_COMPLEXITY_COST["regime_sizing"]
+    if tm.hmm_regime_filter:
+        tm_cost += _TM_COMPLEXITY_COST["hmm_regime_filter"]
+    if tm.hmm_regime_sizing:
+        tm_cost += _TM_COMPLEXITY_COST["hmm_regime_sizing"]
+    return int(filter_cost + tm_cost)
+
+
+def _enforce_complexity_cap(strat: StrategyDefinition, cap: int) -> None:
+    """Disable costly TM overlays until score fits ``cap`` (filters kept)."""
+    cap = max(1, int(cap))
+    # Drop highest-cost TM features first.
+    drops = (
+        ("hmm_regime_sizing", "hmm_regime_sizing"),
+        ("hmm_regime_filter", "hmm_regime_filter"),
+        ("regime_sizing", "regime_sizing"),
+        ("regime_filter", "regime_filter"),
+    )
+    tm = strat.trade_mgmt
+    while _complexity_score(strat) > cap:
+        trimmed = False
+        for attr, _key in drops:
+            if getattr(tm, attr, False):
+                setattr(tm, attr, False)
+                trimmed = True
+                break
+        if not trimmed:
+            break
 
 
 # ---------------------------------------------------------------------------
@@ -798,8 +1162,13 @@ def mutate(strategy: StrategyDefinition, rng: Optional[random.Random] = None,
                 if new_val != block.params.get(name):
                     block.params[name] = new_val
                     mutations.append(f"{name}={new_val}")
-    clone.lineage = Lineage(parents=[strategy.id], mutations=mutations,
-                            generation=strategy.lineage.generation + 1)
+    clone.lineage = Lineage(
+        parents=[strategy.id], mutations=mutations,
+        generation=strategy.lineage.generation + 1,
+        role=strategy.lineage.role,
+        edge_id=strategy.lineage.edge_id,
+    )
+    clone.profile.search_phase = strategy.profile.search_phase
     clone.profile.complexity_score = int(
         sum(_COMPLEXITY_COST.get(f.type, 1) for f in clone.entry_filters)
     )

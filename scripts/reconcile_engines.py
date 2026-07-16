@@ -9,6 +9,9 @@ Usage:
     python scripts/reconcile_engines.py [--n 10] [--symbol EURUSD]
         [--timeframe M15] [--days 365] [--survivors] [--seed 42]
 
+    # After percent/ATR exits ship, also reconcile a crypto sample:
+    python scripts/reconcile_engines.py --n 8 --symbol BTCUSD --timeframe H1
+
 Exit code 1 when fewer than half the strategies reconcile within tolerance —
 suitable as a CI gate on machines with MT5 provisioned.
 """

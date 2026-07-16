@@ -5,7 +5,7 @@ point = 0.01, contract size = 100  ->  point_value = $1 per point per 1.0 lot.
 Spread and slippage are zero, so every fill lands exactly on the bar close.
 
 Scenario (base lots 0.10, grid step 100 pts, lot multiplier 2.0,
-max levels 3, basket TP 50 pts):
+max levels 3, basket TP 50 pts, basket SL 500 pts — far enough not to fire):
 
 bar 10  close 100.0  -> long entry 0.10 @ 100.0
 bar 11  close  99.0  -> 100 pts adverse -> grid add 0.20 @ 99.0
@@ -42,11 +42,14 @@ def _bars(closes, highs=None, lows=None):
     })
 
 
-def _dca_strategy() -> StrategyDefinition:
+def _dca_strategy(**extra) -> StrategyDefinition:
+    params = {"grid_step_points": 100.0, "lot_multiplier": 2.0,
+              "max_levels": 3.0, "basket_tp_points": 50.0,
+              "basket_sl_points": 500.0}
+    params.update(extra)
     mech = ExecutionMechanic(
         type=ExecutionMechanicType.DCA_GRID,
-        params={"grid_step_points": 100.0, "lot_multiplier": 2.0,
-                "max_levels": 3.0, "basket_tp_points": 50.0},
+        params=params,
         ranges={"grid_step_points": ParamRange(min=50, max=500, step=50)},
     )
     return StrategyDefinition(
@@ -107,6 +110,36 @@ def test_dca_profit_and_floating_drawdown(dca_run):
 def test_dca_respects_max_levels(dca_run):
     _, book = dca_run
     assert len(book.closed) == 3    # never a 4th level despite bar 13 drop
+
+
+def test_dca_shared_basket_sl_closes_all(monkeypatch):
+    """Shared basket SL from VWAP closes every open leg at the same stop."""
+    # Entry @ 100, add @ 99 → avg = (100*0.1 + 99*0.2)/0.3 = 99.333...
+    # basket_sl 50 pts → stop = avg - 0.50 = 98.833...
+    # bar 12 low punches through the shared stop → both legs exit together.
+    closes = [100.0] * 11 + [99.0, 98.5, 98.5]
+    lows = list(closes)
+    lows[12] = 98.5
+    df = _bars(closes, lows=lows)
+    n = len(df)
+    long_sig = np.zeros(n, dtype=bool)
+    long_sig[10] = True
+    monkeypatch.setattr(sim, "compute_signals",
+                        lambda *a, **k: (long_sig, np.zeros(n, dtype=bool), 1))
+
+    strat = _dca_strategy(max_levels=3.0, basket_tp_points=200.0,
+                          basket_sl_points=50.0)
+    metrics, book = run_simulation(df, strat, SPEC, deposit=10_000.0)
+
+    assert metrics.trade_count == 2
+    trades = sorted(book.closed, key=lambda t: t.open_time)
+    assert [t.lots for t in trades] == pytest.approx([0.10, 0.20])
+    avg = (100.0 * 0.1 + 99.0 * 0.2) / 0.3
+    stop = avg - 50 * SPEC.point
+    for t in trades:
+        assert t.exit_price == pytest.approx(stop)
+        assert t.close_time == trades[0].close_time
+    assert not book.positions
 
 
 def test_position_book_margin_refusal():

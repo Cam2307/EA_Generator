@@ -33,6 +33,24 @@ def test_boundary_and_clamp(monkeypatch):
     assert not was and same == NOW
 
 
+def test_history_window_survives_equal_months_holdout(monkeypatch):
+    """Overnight preset (12m history, 12m holdout) must not collapse to hours."""
+    from config import settings
+    from factory.discovery_config import history_start_end
+
+    monkeypatch.setattr(settings, "HOLDOUT_ENABLED", True, raising=False)
+    monkeypatch.setattr(settings, "HOLDOUT_MONTHS", 12, raising=False)
+    start, end = history_start_end(12, today=NOW.date())
+    clamped, was = clamp_discovery_end(end, now=NOW)
+    assert was or clamped == end or clamped <= end
+    # Rebase the way the worker does after clamp.
+    if was:
+        start = clamped - timedelta(days=12 * settings.DAYS_PER_MONTH)
+        end = clamped
+    assert (end - start).days >= 360
+    assert end <= holdout_boundary(NOW) + timedelta(days=1)
+
+
 class _Engine(BacktestEngine):
     name = "stub"
 
